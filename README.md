@@ -38,7 +38,7 @@ npm run scan -- BTC ETH SOL     # свои тикеры
 npm run scan -- --json          # вывод в JSON
 ```
 
-Как добавлять и удалять токены в списке: [docs/watchlist.md](docs/watchlist.md).
+Как добавлять и удалять токены в списке: [Инструкция по добавлению новых токенов/watchlist.md](<Инструкция по добавлению новых токенов/watchlist.md>).
 
 ## Подключение к Claude Code
 

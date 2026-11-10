@@ -10,7 +10,7 @@ import { BingXClient } from "../src/bingx.js";
 // Favorites from the BingX account (edit as needed).
 const WATCHLIST = `BTC ETH SOL ZEC XRP 1000PEPE HYPE AVAX AAVE ARB BNB SUI LINK ENA DOGE UNI TAO ADA ASTER
 PUMP ZRO APT TIA OP ETHFI FARTCOIN DASH TRX WIF PENGU STRK LDO USELESS AERO XPL SPX WLFI 1000BONK ZK
-MORPHO MYX ARC MNT FLOKI RATS ANSEM`;
+MORPHO MYX ARC MNT FLOKI RATS ANSEM SOON TWT`;
 
 const args = process.argv.slice(2);
 const asJson = args.includes("--json");
