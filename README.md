@@ -28,6 +28,16 @@ npm install
 $env:BINGX_API_KEY="..."; $env:BINGX_SECRET_KEY="..."; npm run check
 ```
 
+## Сканер рынка
+
+Тренд (EMA20/50 на 4ч и 1д), RSI, ATR, funding и диапазон за 30 дней по списку фьючерсов, плюс подсказка по сетапу. Нужны только публичные данные, ключи не требуются.
+
+```bash
+npm run scan                    # список избранного (WATCHLIST в scripts/scan.js)
+npm run scan -- BTC ETH SOL     # свои тикеры
+npm run scan -- --json          # вывод в JSON
+```
+
 ## Подключение к Claude Code
 
 ```bash
