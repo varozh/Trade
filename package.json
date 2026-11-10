@@ -10,7 +10,9 @@
   "scripts": {
     "start": "node src/server.js",
     "check": "node scripts/check.js",
-    "scan": "node scripts/scan.js"
+    "scan": "node scripts/scan.js",
+    "scan:vk": "node --env-file=.env scripts/scan.js --vk",
+    "vk:users": "node --env-file=.env scripts/vk-users.js"
   },
   "license": "MIT",
   "dependencies": {

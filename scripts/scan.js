@@ -5,7 +5,10 @@
 //   npm run scan                      – scan the default watchlist (WATCHLIST below)
 //   npm run scan -- BTC ETH SOL       – scan given symbols
 //   npm run scan -- --json            – raw JSON instead of a table
+//   npm run scan -- --vk              – also send a short summary to VK (needs VK_TOKEN, VK_USER_ID)
+//   npm run scan -- --vk-dry          – print that VK summary without sending
 import { BingXClient } from "../src/bingx.js";
+import { sendVk } from "../src/vk.js";
 
 // Favorites from the BingX account (edit as needed).
 const WATCHLIST = `BTC ETH SOL ZEC XRP 1000PEPE HYPE AVAX AAVE ARB BNB SUI LINK ENA DOGE UNI TAO ADA ASTER
@@ -135,4 +138,43 @@ if (asJson) {
   for (const r of rows) console.log(r.length > 2 ? line(r) : r.join("  "));
   const dn = results.filter((r) => r.trend1d === "DN").length;
   console.log(`\nDaily downtrend: ${dn}/${results.filter((r) => !r.error).length}`);
+}
+
+// Short summary for VK: a wide table is unreadable in a messenger, so only symbols with a signal, grouped.
+function vkSummary(results) {
+  const ok = results.filter((r) => !r.error);
+  const pct = (x) => (x == null ? "" : `${x >= 0 ? "+" : ""}${x.toFixed(1)}%`);
+  const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
+  const lines = [
+    `BingX скан ${ts} UTC, монет: ${ok.length}`,
+    `Дневной даунтренд: ${ok.filter((r) => r.trend1d === "DN").length}/${ok.length}`,
+  ];
+  const groups = new Map();
+  for (const r of ok) {
+    const s = signal(r);
+    if (s === "-") continue;
+    if (!groups.has(s)) groups.set(s, []);
+    groups.get(s).push(r);
+  }
+  for (const [s, rs] of groups) {
+    lines.push("", `${s} (${rs.length}):`);
+    for (const r of rs) {
+      lines.push(`• ${r.symbol} ${+r.price.toPrecision(5)} | 1d ${pct(r.ch1d)} 7d ${pct(r.ch7d)} | RSI4h ${r.rsi4h.toFixed(0)} | EMA20 4h ${+r.ema20_4h.toPrecision(5)}`);
+    }
+  }
+  const errs = results.filter((r) => r.error);
+  if (errs.length) lines.push("", `Ошибки: ${errs.map((r) => r.symbol).join(", ")}`);
+  return lines.join("\n");
+}
+
+if (args.includes("--vk-dry")) {
+  console.log("\n--- VK message ---\n" + vkSummary(results));
+} else if (args.includes("--vk")) {
+  try {
+    await sendVk(vkSummary(results));
+    console.log("\nSent to VK.");
+  } catch (e) {
+    console.error(`\nVK send failed: ${e.message}`);
+    process.exitCode = 1;
+  }
 }
