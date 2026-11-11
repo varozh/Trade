@@ -140,30 +140,64 @@ if (asJson) {
   console.log(`\nDaily downtrend: ${dn}/${results.filter((r) => !r.error).length}`);
 }
 
-// Short summary for VK: a wide table is unreadable in a messenger, so only symbols with a signal, grouped.
+// VK report: only setups that can be worked in the next 1–2 hours.
+// A setup qualifies when the price is already close to its entry level (EMA20 4h):
+// within READY_ATR of one 4h ATR — a distance the price can cover in an hour or two.
+// Oversold shorts, warnings (squeeze, crowded longs) and "avoid" are dropped: they are not entries.
+const READY_ATR = 0.75;      // max distance to EMA20 4h, in 4h ATRs
+const MAX_ATR_D = 10;        // skip coins with daily ATR above this %, too wild
+const MIN_VOL_RATIO = 0.5;   // skip coins whose volume dried up (7d vs 30d)
+const MAX_FUNDING = 0.03;    // skip if funding (%) is crowded against the trade
+const MAX_SETUPS = 8;        // keep the message short
+
+const SETUPS = {
+  "LONG on pullback to EMA20 4h": { side: "long", title: "🟢 ЛОНГ на откате к EMA20 (4ч)" },
+  "SHORT on bounce to EMA20 4h": { side: "short", title: "🔴 ШОРТ на отскоке к EMA20 (4ч)" },
+};
+
+function readySetup(r) {
+  const setup = SETUPS[signal(r)];
+  if (!setup || r.atr1dPct > MAX_ATR_D || r.volRatio7to30 < MIN_VOL_RATIO) return null;
+  const long = setup.side === "long";
+  // Distance from price to EMA20 in the direction the price must move to reach the entry.
+  const dist = (long ? r.price - r.ema20_4h : r.ema20_4h - r.price) / r.atr4h;
+  if (dist < 0 || dist > READY_ATR) return null;
+  if (long ? r.rsi4h > 65 || r.fundingPct > MAX_FUNDING : r.rsi4h < 35 || r.fundingPct < -MAX_FUNDING) return null;
+  return { ...setup, dist };
+}
+
 function vkSummary(results) {
   const ok = results.filter((r) => !r.error);
-  const pct = (x) => (x == null ? "" : `${x >= 0 ? "+" : ""}${x.toFixed(1)}%`);
-  const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
+  const pct = (x) => (x == null ? "—" : `${x >= 0 ? "+" : ""}${x.toFixed(1)}%`);
+  const num = (x) => String(+x.toPrecision(5));
+  const ts = new Date().toLocaleString("ru-RU", { timeZone: "Europe/Moscow", dateStyle: "short", timeStyle: "short" });
+  const dn = ok.filter((r) => r.trend1d === "DN").length;
+  const up = ok.filter((r) => r.trend1d === "UP").length;
   const lines = [
-    `BingX скан ${ts} UTC, монет: ${ok.length}`,
-    `Дневной даунтренд: ${ok.filter((r) => r.trend1d === "DN").length}/${ok.length}`,
+    `📊 Скан BingX — ${ts} МСК`,
+    `Монет: ${ok.length} · 📈 рост: ${up} · 📉 падение: ${dn} (дневной тренд)`,
   ];
-  const groups = new Map();
-  for (const r of ok) {
-    const s = signal(r);
-    if (s === "-") continue;
-    if (!groups.has(s)) groups.set(s, []);
-    groups.get(s).push(r);
+  const ready = ok
+    .map((r) => ({ r, s: readySetup(r) }))
+    .filter((x) => x.s)
+    .sort((a, b) => a.s.dist - b.s.dist)
+    .slice(0, MAX_SETUPS);
+  if (!ready.length) {
+    lines.push("", "━━━━━━━━━━━━", "😴 Готовых входов на ближайшие 1–2 часа нет. Ждём.");
   }
-  for (const [s, rs] of groups) {
-    lines.push("", `${s} (${rs.length}):`);
-    for (const r of rs) {
-      lines.push(`• ${r.symbol} ${+r.price.toPrecision(5)} | 1d ${pct(r.ch1d)} 7d ${pct(r.ch7d)} | RSI4h ${r.rsi4h.toFixed(0)} | EMA20 4h ${+r.ema20_4h.toPrecision(5)}`);
+  for (const title of Object.values(SETUPS).map((s) => s.title)) {
+    const rs = ready.filter((x) => x.s.title === title);
+    if (!rs.length) continue;
+    lines.push("", "━━━━━━━━━━━━", `${title} — ${rs.length}`, "");
+    for (const { r } of rs) {
+      const toEntry = (r.ema20_4h / r.price - 1) * 100;
+      lines.push(`▪️ ${r.symbol}: ${num(r.price)} $ → вход ~${num(r.ema20_4h)} (${pct(toEntry)})`);
+      lines.push(`     24ч ${pct(r.ch1d)} · 7д ${pct(r.ch7d)} · RSI ${r.rsi4h.toFixed(0)}`);
     }
   }
   const errs = results.filter((r) => r.error);
-  if (errs.length) lines.push("", `Ошибки: ${errs.map((r) => r.symbol).join(", ")}`);
+  if (errs.length) lines.push("", `❗ Не загрузились: ${errs.map((r) => r.symbol).join(", ")}`);
+  lines.push("", "ℹ️ Только монеты, где цена уже рядом с EMA20 (4ч). Перепроданные, перегретые и неликвидные отсеяны.");
   return lines.join("\n");
 }
 
