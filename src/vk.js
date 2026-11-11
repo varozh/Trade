@@ -5,7 +5,26 @@ const API = "https://api.vk.com/method/";
 const VERSION = "5.199";
 const MAX_LEN = 4000; // VK limit is 4096 chars per message
 
-export async function vkCall(method, params, token = process.env.VK_TOKEN) {
+import { readFileSync } from "node:fs";
+
+// VK_* from this project's .env win over the process environment: other scripts on the same
+// server (e.g. a crontab with its own VK_TOKEN for another community) must not hijack the sender.
+const ownEnv = (() => {
+  try {
+    const text = readFileSync(new URL("../.env", import.meta.url), "utf8");
+    return Object.fromEntries(
+      text.split(/\r?\n/)
+        .map((l) => l.match(/^\s*(VK_[A-Z_]+)\s*=\s*["']?(.*?)["']?\s*$/))
+        .filter(Boolean)
+        .map((m) => [m[1], m[2]]),
+    );
+  } catch {
+    return {};
+  }
+})();
+const env = (name) => ownEnv[name] || process.env[name];
+
+export async function vkCall(method, params, token = env("VK_TOKEN")) {
   if (!token) throw new Error("VK_TOKEN is not set");
   const body = new URLSearchParams({ ...params, access_token: token, v: VERSION });
   const res = await fetch(API + method, { method: "POST", body });
@@ -29,7 +48,7 @@ export function splitText(text, max = MAX_LEN) {
   return parts;
 }
 
-export async function sendVk(text, userId = process.env.VK_USER_ID) {
+export async function sendVk(text, userId = env("VK_USER_ID")) {
   if (!userId) throw new Error("VK_USER_ID is not set");
   for (const part of splitText(text)) {
     await vkCall("messages.send", {
