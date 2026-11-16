@@ -14,6 +14,7 @@
     "scan:send": "node --env-file=.env scripts/scan.js --send",
     "events": "node --env-file=.env scripts/events.js",
     "alerts": "node --env-file=.env scripts/alerts.js",
+    "journal": "node --env-file=.env scripts/journal.js",
     "vk:users": "node --env-file=.env scripts/vk-users.js"
   },
   "license": "MIT",
