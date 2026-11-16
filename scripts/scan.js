@@ -10,6 +10,7 @@
 //   npm run scan -- --dry             – print that message without sending (--vk-dry is the same)
 import { BingXClient } from "../src/bingx.js";
 import { sendAll } from "../src/notify.js";
+import { sendTg } from "../src/tg.js";
 import { toSymbols, pub, klines, sleep } from "../src/quotes.js";
 import { readJson, writeJson, readSignals, appendSignals, isPaused } from "../src/store.js";
 import { btcDominance, todayEvents, okxLiquidations, TZ, TZ_LABEL } from "../src/market.js";
@@ -66,7 +67,7 @@ async function analyze(symbol) {
     ch1d: chg(1), ch7d: chg(7), ch30d: chg(30),
     rsi4h: rsi(c4), rsi1d: rsi(cd),
     trend4h: trend(p, e20, e50), trend1d: trend(p, e20d, e50d),
-    ema20_4h: e20, ema50_4h: e50,
+    ema20_4h: e20, ema50_4h: e50, ema200_4h: e200,
     vsEma200_4h: (p / e200 - 1) * 100,
     hi30, lo30, pos30: ((p - lo30) / (hi30 - lo30)) * 100,
     atr1dPct: (atr(d) / p) * 100, atr4h: atr(h4),
@@ -197,17 +198,21 @@ function tradePlan(r) {
   const dist = (long ? r.price - entry : entry - r.price) / a;
   if (dist < 0 || dist > READY_ATR) return null;
   if (long ? r.rsi4h > 65 || r.fundingPct > MAX_FUNDING : r.rsi4h < 35 || r.fundingPct < -MAX_FUNDING) return null;
+  const lv = levels(r, side);
+  return lv.rr < MIN_RR_WEAK ? null : lv;
+}
 
-  const dir = long ? 1 : -1;
+// Entry / stop / target for a side, without any filters.
+function levels(r, side) {
+  const long = side === "long", dir = long ? 1 : -1, a = r.atr4h, entry = r.ema20_4h;
   const swing = long ? Math.min(r.swingLo4h, entry) : Math.max(r.swingHi4h, entry);
   let stop = swing - dir * STOP_BUFFER_ATR * a;
   if (Math.abs(entry - stop) < MIN_STOP_ATR * a) stop = entry - dir * MIN_STOP_ATR * a;
   let target = long ? r.hi7d4h : r.lo7d4h, tpBy = "структура";
   if ((target - entry) * dir < 1.5 * a) { target = entry + dir * ATR_TARGET * a; tpBy = "ATR"; }
   const risk = Math.abs(entry - stop), rr = Math.abs(target - entry) / risk;
-  if (rr < MIN_RR_WEAK) return null;
-  const stopPct = (risk / entry) * 100;
-  return { side, entry, stop, target, tpBy, rr, dist, stopPct };
+  const dist = (long ? r.price - entry : entry - r.price) / a;
+  return { side, entry, stop, target, tpBy, rr, dist, stopPct: (risk / entry) * 100 };
 }
 
 // BTC dominance filter. Rising dominance while BTC falls: money leaves alts, they fall harder.
@@ -268,7 +273,7 @@ async function vkSummary(results, deposit) {
 
   // Repeat: the same coin and direction was already sent in the last 24h. Still shown, just marked.
   const now = Date.now();
-  const recent = readSignals().filter((s) => now - s.ts < REPEAT_H * 3600e3);
+  const recent = readSignals().filter((s) => !s.manual && now - s.ts < REPEAT_H * 3600e3);
   const signals = [...strong, ...weak].map(({ r, t }, i) => ({
     id: `${now.toString(36)}${i}`,
     ts: now,
@@ -339,10 +344,14 @@ async function vkSummary(results, deposit) {
 }
 
 // --send (or the old --vk) sends to every configured messenger; --dry (--vk-dry) only prints.
+// --coin: detailed analysis and forecast of the given coins, to Telegram only (asked from the bot).
 const dry = args.includes("--dry") || args.includes("--vk-dry");
 const send = args.includes("--send") || args.includes("--vk");
-const msg = dry || send ? await vkSummary(results, await fetchDeposit()) : null;
-if ((dry || send) && !msg) {
+const coinMode = args.includes("--coin");
+const msg = !coinMode && (dry || send) ? await vkSummary(results, await fetchDeposit()) : null;
+if (coinMode) {
+  await coinReports();
+} else if ((dry || send) && !msg) {
   console.log(`\nNo setups with R:R >= 1:${MIN_RR_WEAK}, nothing sent.`);
 } else if (dry) {
   console.log("\n--- message ---\n" + msg.text);
@@ -351,4 +360,143 @@ if ((dry || send) && !msg) {
   appendSignals(msg.signals);
   if (isPaused()) console.log("\nPaused from Telegram, nothing sent.");
   else if (!(await sendAll(msg.text, { tgButtons: msg.buttons }))) process.exitCode = 1;
+}
+
+// ---------- /coin: analysis and forecast of one coin ----------
+
+// Technical outlook for the next 1–2 days from the same indicators the scanner uses.
+// Each factor adds to a score; the sum gives the bias. Levels come from EMAs and recent swings.
+function forecast(r, regime) {
+  let score = 0;
+  const why = [];
+  const add = (v, text) => ((score += v), why.push(text));
+  if (r.trend1d === "UP") add(2, "дневной тренд вверх");
+  if (r.trend1d === "DN") add(-2, "дневной тренд вниз");
+  if (r.trend4h === "UP") add(1, "4-часовой тренд вверх");
+  if (r.trend4h === "DN") add(-1, "4-часовой тренд вниз");
+  if (r.vsEma200_4h > 0) add(1, `цена выше EMA200 (4ч) на ${r.vsEma200_4h.toFixed(1)}%`);
+  else add(-1, `цена ниже EMA200 (4ч) на ${Math.abs(r.vsEma200_4h).toFixed(1)}%`);
+  if (r.rsi1d < 30) add(1, `RSI 1д ${r.rsi1d.toFixed(0)} — перепроданность, возможен отскок`);
+  if (r.rsi1d > 70) add(-1, `RSI 1д ${r.rsi1d.toFixed(0)} — перекупленность, возможен откат`);
+  if (r.rsi4h < 30) add(0.5, `RSI 4ч ${r.rsi4h.toFixed(0)} — локальная перепроданность`);
+  if (r.rsi4h > 70) add(-0.5, `RSI 4ч ${r.rsi4h.toFixed(0)} — локальная перекупленность`);
+  if (r.fundingPct > MAX_FUNDING) add(-0.5, `фандинг ${r.fundingPct.toFixed(3)}% — перекос в лонги`);
+  if (r.fundingPct < -MAX_FUNDING) add(0.5, `фандинг ${r.fundingPct.toFixed(3)}% — перекос в шорты, риск сквиза`);
+  if (r.oiCh24h != null && Math.abs(r.oiCh24h) >= 3) {
+    if (r.oiCh24h > 0 && r.ch1d > 0) add(1, `OI +${r.oiCh24h.toFixed(0)}% на росте — рост подтверждается новыми позициями`);
+    if (r.oiCh24h > 0 && r.ch1d < 0) add(-1, `OI +${r.oiCh24h.toFixed(0)}% на падении — набираются шорты`);
+    if (r.oiCh24h < 0 && r.ch1d > 0) why.push(`OI ${r.oiCh24h.toFixed(0)}% на росте — рост на закрытии шортов, слабый`);
+    if (r.oiCh24h < 0 && r.ch1d < 0) why.push(`OI ${r.oiCh24h.toFixed(0)}% на падении — выходят лонги`);
+  }
+  if (r.symbol !== "BTC" && regime === "alts-weak") add(-1, "доминация BTC растёт при падении BTC — альты слабее");
+  if (r.symbol !== "BTC" && regime === "alts-strong") add(1, "доминация BTC падает при росте BTC — альты сильнее");
+  const bias = score >= 2 ? "up" : score <= -2 ? "down" : "flat";
+
+  // Key levels around the price (merged when closer than 0.3%).
+  const cand = [
+    [r.ema20_4h, "EMA20 4ч"], [r.ema50_4h, "EMA50 4ч"], [r.ema200_4h, "EMA200 4ч"],
+    [r.swingHi4h, "макс. 2 дней"], [r.swingLo4h, "мин. 2 дней"],
+    [r.hi7d4h, "макс. 7 дней"], [r.lo7d4h, "мин. 7 дней"], [r.hi30, "макс. 30 дней"], [r.lo30, "мин. 30 дней"],
+  ].sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const [v, n] of cand) {
+    const prev = merged.at(-1);
+    if (prev && Math.abs(v / prev.v - 1) < 0.003) prev.n += `, ${n}`;
+    else merged.push({ v, n });
+  }
+  const res = merged.filter((x) => x.v > r.price * 1.001).slice(0, 2);
+  const sup = merged.filter((x) => x.v < r.price * 0.999).reverse().slice(0, 2);
+  return { score, bias, why, res, sup };
+}
+
+async function coinReports() {
+  const ok = results.filter((r) => !r.error);
+  for (const r of results.filter((x) => x.error)) console.error(`${r.symbol}: ${r.error}`);
+  if (!ok.length) {
+    process.exitCode = 1;
+    return;
+  }
+  const [btcd, btc] = await Promise.all([
+    safe(btcDominance()),
+    ok.find((r) => r.symbol === "BTC") ?? safe(analyze("BTC-USDT")),
+  ]);
+  const regime = altRegime(btcd?.change24h, btc?.ch1d);
+  const n = (x) => String(+x.toPrecision(5));
+  const pct = (x) => (x == null ? "—" : `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(1)}%`);
+  const arrow = { UP: "⬆️", DN: "⬇️", MIX: "↔️" };
+  const ts = new Date().toLocaleString("ru-RU", { timeZone: TZ, dateStyle: "short", timeStyle: "short" });
+
+  for (const r of ok) {
+    const f = forecast(r, regime);
+    const lq = await safe(okxLiquidations(r.symbol));
+    const L = [
+      `🔎 ${r.symbol} — анализ ${ts} (${TZ_LABEL})`,
+      "",
+      `💵 Цена: ${n(r.price)} · 24ч ${pct(r.ch1d)} · 7д ${pct(r.ch7d)} · 30д ${pct(r.ch30d)}`,
+      `📊 Тренд: 4ч ${arrow[r.trend4h]} · 1д ${arrow[r.trend1d]} · RSI 4ч ${r.rsi4h.toFixed(0)} / 1д ${r.rsi1d.toFixed(0)}`,
+      `〰️ EMA 4ч: 20 → ${n(r.ema20_4h)} · 50 → ${n(r.ema50_4h)} · 200 → ${n(r.ema200_4h)}`,
+      `📏 ATR: ${r.atr1dPct.toFixed(1)}% в день · 30 дней: ${n(r.lo30)}–${n(r.hi30)} (цена на ${r.pos30.toFixed(0)}% диапазона)`,
+      `💸 Фандинг: ${r.fundingPct.toFixed(4)}%` +
+        (r.oiUsd ? ` · OI: ${compactUsd(r.oiUsd)}${r.oiCh24h == null ? "" : ` (${pct(r.oiCh24h)} за сутки)`}` : ""),
+    ];
+    if (lq && (lq.longs || lq.shorts)) L.push(`💥 Ликвидации OKX 24ч: лонги ${compactUsd(lq.longs)} · шорты ${compactUsd(lq.shorts)}`);
+
+    const title = { up: "📈 Бычий", down: "📉 Медвежий", flat: "↔️ Нейтральный" }[f.bias];
+    L.push("", "━━━━━━━━━━━━", `🧭 Прогноз на 1–2 дня: ${title} (оценка ${f.score > 0 ? "+" : ""}${f.score})`, "Почему:");
+    for (const w of f.why) L.push(`• ${w}`);
+    L.push("", "Уровни:");
+    if (f.res.length) L.push(`⬆️ Сопротивление: ${f.res.map((x) => `${n(x.v)} (${x.n})`).join(" · ")}`);
+    if (f.sup.length) L.push(`⬇️ Поддержка: ${f.sup.map((x) => `${n(x.v)} (${x.n})`).join(" · ")}`);
+    const [r1, r2] = f.res, [s1, s2] = f.sup;
+    L.push("", "Сценарии:");
+    if (f.bias === "down") {
+      if (s1) L.push(`▪️ Основной: ${r1 ? `возможен отскок к ${n(r1.v)}, затем ` : ""}снижение к ${n(s1.v)}${s2 ? `, дальше ${n(s2.v)}` : ""}`);
+      if (r1) L.push(`▪️ Отмена: закрепление выше ${n((r2 ?? r1).v)}`);
+    } else if (f.bias === "up") {
+      if (r1) L.push(`▪️ Основной: ${s1 ? `возможен откат к ${n(s1.v)}, затем ` : ""}рост к ${n(r1.v)}${r2 ? `, дальше ${n(r2.v)}` : ""}`);
+      if (s1) L.push(`▪️ Отмена: закрепление ниже ${n((s2 ?? s1).v)}`);
+    } else {
+      if (s1 && r1) L.push(`▪️ Боковик между ${n(s1.v)} и ${n(r1.v)}`);
+      if (r2) L.push(`▪️ Пробой вверх → ${n(r2.v)}`);
+      if (s2) L.push(`▪️ Пробой вниз → ${n(s2.v)}`);
+    }
+    const day = (r.price * r.atr1dPct) / 100;
+    L.push(`📐 Обычный размах за сутки: ${n(r.price - day)}–${n(r.price + day)}`);
+
+    // Setup by the scanner's rules: ready now, or what is missing.
+    let buttons;
+    const side = r.trend4h === "UP" ? "long" : r.trend4h === "DN" ? "short" : null;
+    L.push("", "━━━━━━━━━━━━");
+    if (!side) {
+      L.push("🎯 Сетап: нет — на 4ч нет тренда, вход от EMA20 не работает.");
+    } else {
+      const ready = tradePlan(r);
+      const p = ready ?? levels(r, side);
+      L.push(
+        `🎯 Сетап: ${side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} от EMA20 4ч · R:R 1:${p.rr.toFixed(1)}`,
+        `▶️ Вход: ${n(p.entry)} · ⛔ Стоп: ${n(p.stop)} · 🎯 Тейк: ${n(p.target)}`,
+      );
+      const notes = [];
+      if (r.trend1d !== (side === "long" ? "UP" : "DN")) notes.push("дневной тренд не подтверждает");
+      if (p.dist < 0) notes.push("цена уже прошла вход");
+      else if (p.dist > READY_ATR) notes.push(`до входа ${Math.abs((p.entry / r.price - 1) * 100).toFixed(1)}%, цена пока далеко`);
+      if (side === "short" && r.rsi4h < 35) notes.push("перепроданность — лучше дождаться отскока");
+      if (side === "long" && r.rsi4h > 65) notes.push("перекупленность — лучше дождаться отката");
+      if (p.rr < MIN_RR_WEAK) notes.push("R:R меньше 1:1");
+      L.push(ready ? "✅ Готов по правилам сканера" : `⏳ Пока не готов: ${notes.join("; ") || "не прошёл фильтры сканера"}`);
+      // Buttons only when the plan makes sense now: price before the entry and R:R at least 1:1.
+      if (p.dist >= 0 && p.rr >= MIN_RR_WEAK) {
+        const s = {
+          id: `${Date.now().toString(36)}c`, ts: Date.now(), symbol: r.symbol, side, entry: p.entry, stop: p.stop,
+          target: p.target, rr: +p.rr.toFixed(2), stopPct: p.stopPct, strong: !!ready, repeat: false, manual: true,
+        };
+        if (!dry) appendSignals([s]);
+        buttons = [[RISK_MIN, RISK_MAX].map((k) => ({ text: `${side === "long" ? "🟢" : "🔴"} ${r.symbol} ${k}%`, callback_data: `open:${s.id}:${k}` }))];
+      }
+    }
+    L.push("", "ℹ️ Расчёт по индикаторам, а не гарантия движения.");
+    const text = L.join("\n");
+    if (dry) console.log(`\n${text}`);
+    else await sendTg(text, undefined, buttons).catch((e) => ((process.exitCode = 1), console.error(`Telegram: ${e.message}`)));
+  }
 }

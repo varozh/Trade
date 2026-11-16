@@ -1,7 +1,7 @@
 // Telegram control bot. Runs all the time (systemd service on the server), long-polls Telegram.
 // Answers only the chat in TG_CHAT_ID; everyone else is ignored.
 //
-// Commands: /scan /signals /status /positions /journal [days] /stats [days] /top /list /add SYM /remove SYM
+// Commands: /scan /coin SYM /signals /status /positions /journal [days] /stats [days] /top /list /add SYM /remove SYM
 //           /pause [hours] /resume /help
 // Signal buttons "SYM 5%" / "SYM 15%" (under scanner messages and /signals) open a position after a confirmation.
 //
@@ -56,6 +56,7 @@ const commands = {
       [
         "🤖 Команды:",
         "/scan — скан прямо сейчас",
+        "/coin SOL — анализ и прогноз по монете",
         "/signals — сигналы последнего скана с кнопками открытия",
         "/status — депозит, позиции, пауза",
         "/positions — открытые позиции",
@@ -77,7 +78,7 @@ const commands = {
     await runAndReport("scan.js", ["--send"], "⏳ Сканирую, около минуты…", /nothing sent/, "Подходящих сетапов сейчас нет.");
   },
   async signals() {
-    const all = readSignals();
+    const all = readSignals().filter((s) => !s.manual); // /coin analyses are not scanner signals
     const lastTs = all.at(-1)?.ts;
     const list = all.filter((s) => s.ts === lastTs && Date.now() - s.ts < SIGNAL_MAX_AGE_H * 3600e3);
     if (!list.length) return say(`Свежих сигналов нет (не старше ${SIGNAL_MAX_AGE_H} ч). Запустите /scan.`);
@@ -114,6 +115,19 @@ const commands = {
   },
   async top() {
     await runAndReport("top.js", [], "⏳ Собираю список…");
+  },
+  async coin(arg) {
+    const syms = arg.split(/[\s,]+/).filter(Boolean).map(base).slice(0, 3);
+    if (!syms.length) return say("Укажите монету: /coin SOL (до 3 сразу: /coin SOL ETH BTC)");
+    const bad = [];
+    for (const s of syms) if (!(await exists(s))) bad.push(`${s}${(await exists(`1000${s}`)) ? ` (есть 1000${s})` : ""}`);
+    if (bad.length) return say(`Нет на BingX: ${bad.join(", ")}`);
+    await say(`⏳ Анализирую ${syms.join(", ")}…`);
+    const { code, out } = await run("scan.js", [...syms, "--coin"]);
+    if (code !== 0) await say(`⚠️ Ошибка:\n${out.trim().split("\n").slice(-5).join("\n")}`);
+  },
+  analyze(arg) {
+    return commands.coin(arg);
   },
   async list() {
     const w = watchlist();
@@ -216,6 +230,7 @@ const own = (chat) => String(chat?.id) === CHAT;
 await tgCall("setMyCommands", {
   commands: [
     ["scan", "скан прямо сейчас"],
+    ["coin", "анализ и прогноз, /coin SOL"],
     ["signals", "сигналы с кнопками открытия"],
     ["status", "депозит, позиции, пауза"],
     ["positions", "открытые позиции"],

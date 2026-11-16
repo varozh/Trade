@@ -21,7 +21,7 @@ const RISK = Number(env("SCAN_RISK_MIN_PCT")) || 5;
 const D = 864e5, now = Date.now(), from = now - days * D;
 
 // First signal of each coin+direction; later repeats within 24h are the same idea.
-const all = readSignals().filter((s) => s.ts >= from).sort((a, b) => a.ts - b.ts);
+const all = readSignals().filter((s) => !s.manual && s.ts >= from).sort((a, b) => a.ts - b.ts); // /coin analyses excluded
 const firsts = all.filter((s) => !s.repeat);
 const repeats = all.length - firsts.length;
 
