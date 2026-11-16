@@ -158,6 +158,8 @@ const MIN_RR = envNum("SCAN_MIN_RR", 2);          // main list: reward/risk at l
 const MIN_RR_WEAK = envNum("SCAN_MIN_RR_WEAK", 1); // separate list: from 1:MIN_RR_WEAK up to 1:MIN_RR
 const MAX_WEAK = 3;                                // keep the weaker list short
 const REPEAT_H = 24;                               // same coin+direction within this many hours = repeat
+const MAX_WATCH = 8;                               // watch list size
+const MAX_WATCH_ATR = 3;                           // watch list: entry at most this many 4h ATRs away
 const RISK_MIN = envNum("SCAN_RISK_MIN_PCT", 5);  // risk per trade, % of deposit (lower bound)
 const RISK_MAX = envNum("SCAN_RISK_MAX_PCT", 15); // risk per trade, % of deposit (upper bound)
 const LEVERAGE = envNum("SCAN_LEVERAGE", 30);     // leverage used to open trades: margin = position / leverage
@@ -259,7 +261,19 @@ async function vkSummary(results, deposit) {
   // Against the market (see altRegime): never in the strong list, whatever the R:R.
   const strong = all.filter((x) => x.t.rr >= MIN_RR && x.mkt !== "against").slice(0, MAX_SETUPS);
   const weak = all.filter((x) => x.t.rr < MIN_RR || x.mkt === "against").slice(0, MAX_WEAK);
-  if (!strong.length && !weak.length) return null; // nothing worth a message
+  // Watch list: good setups whose entry is still far away — a limit order can wait there.
+  const taken = new Set(all.map((x) => x.r.symbol));
+  const watch = ok
+    .filter((r) => !taken.has(r.symbol))
+    .map((r) => ({ r, t: watchPlan(r) }))
+    .filter((x) => x.t && regimeTag(regime, x.r.symbol, x.t.side) !== "against")
+    .sort((a, b) => a.t.dist - b.t.dist)
+    .slice(0, MAX_WATCH);
+  if (!strong.length && !weak.length) {
+    // Only the watch list: send it when it changed since the last message, not every 2 hours.
+    const key = watch.map((x) => `${x.r.symbol}:${x.t.side}`).sort().join(",");
+    if (!watch.length || key === readJson("watch-last.json", {}).key) return null;
+  }
 
   const lines = [`📊 Скан BingX — ${ts} (${TZ_LABEL})`];
   if (DEPOSIT) lines.push(`💼 Депозит: ${usd(DEPOSIT)} $${deposit.source === ".env" ? " (из настроек)" : ""}`);
@@ -274,7 +288,7 @@ async function vkSummary(results, deposit) {
   // Repeat: the same coin and direction was already sent in the last 24h. Still shown, just marked.
   const now = Date.now();
   const recent = readSignals().filter((s) => !s.manual && now - s.ts < REPEAT_H * 3600e3);
-  const signals = [...strong, ...weak].map(({ r, t }, i) => ({
+  const signals = [...strong, ...weak, ...watch].map(({ r, t }, i) => ({
     id: `${now.toString(36)}${i}`,
     ts: now,
     symbol: r.symbol,
@@ -285,6 +299,7 @@ async function vkSummary(results, deposit) {
     rr: +t.rr.toFixed(2),
     stopPct: t.stopPct,
     strong: i < strong.length,
+    ...(i >= strong.length + weak.length ? { watch: true } : {}),
     repeat: recent.some((s) => s.symbol === r.symbol && s.side === t.side),
   }));
   const sig = new Map(signals.map((s) => [s.symbol, s]));
@@ -335,12 +350,35 @@ async function vkSummary(results, deposit) {
   };
   section(`✅ СИЛЬНЫЕ: R:R от 1:${MIN_RR}`, strong);
   section(`🟡 СЛАБЕЕ: R:R 1:${MIN_RR_WEAK}–1:${MIN_RR}${weak.some((x) => x.mkt === "against") ? " или против рынка" : ""}`, weak);
+  if (watch.length) {
+    lines.push("", "━━━━━━━━━━━━", `⏳ ЖДЁМ ОТСКОКА К ВХОДУ — ${watch.length}`, "Лимитный ордер можно выставить заранее:", "");
+    for (const { r, t } of watch) {
+      const to = (t.entry / r.price - 1) * 100;
+      lines.push(
+        `${t.side === "long" ? "🟢" : "🔴"} ${r.symbol}: вход ${num(t.entry)} (${to >= 0 ? "+" : "−"}${Math.abs(to).toFixed(1)}%) · R:R 1:${t.rr.toFixed(1)}` +
+          (sig.get(r.symbol)?.repeat ? " · 🔁" : ""),
+        `     ⛔ ${num(t.stop)} · 🎯 ${num(t.target)}`,
+      );
+    }
+  }
   // Telegram buttons: open a signal at the lower or upper risk (the bot asks to confirm first).
   const buttons = signals.map((s) => [
-    { text: `${s.side === "long" ? "🟢" : "🔴"} ${s.symbol} ${RISK_MIN}%`, callback_data: `open:${s.id}:${RISK_MIN}` },
+    { text: `${s.watch ? "⏳" : s.side === "long" ? "🟢" : "🔴"} ${s.symbol} ${RISK_MIN}%`, callback_data: `open:${s.id}:${RISK_MIN}` },
     { text: `${s.symbol} ${RISK_MAX}%`, callback_data: `open:${s.id}:${RISK_MAX}` },
   ]);
-  return { text: lines.join("\n"), buttons, signals };
+  const watchKey = watch.map((x) => `${x.r.symbol}:${x.t.side}`).sort().join(",");
+  return { text: lines.join("\n"), buttons, signals, watchKey };
+}
+
+// Watch list rule: the same trend setup as tradePlan, but the price is still MORE than READY_ATR
+// from the entry (up to MAX_WATCH_ATR), and oversold/overbought is fine — that is exactly why it waits.
+function watchPlan(r) {
+  const side = r.trend4h === "UP" && r.trend1d === "UP" ? "long" : r.trend4h === "DN" && r.trend1d === "DN" ? "short" : null;
+  if (!side || r.atr1dPct > MAX_ATR_D || r.volRatio7to30 < MIN_VOL_RATIO) return null;
+  if (side === "long" ? r.fundingPct > MAX_FUNDING : r.fundingPct < -MAX_FUNDING) return null;
+  const lv = levels(r, side);
+  if (lv.dist <= READY_ATR || lv.dist > MAX_WATCH_ATR || lv.rr < MIN_RR) return null;
+  return lv;
 }
 
 // --send (or the old --vk) sends to every configured messenger; --dry (--vk-dry) only prints.
@@ -358,6 +396,7 @@ if (coinMode) {
 } else if (send) {
   // Signals are logged even while paused: the weekly statistics should see them.
   appendSignals(msg.signals);
+  writeJson("watch-last.json", { key: msg.watchKey });
   if (isPaused()) console.log("\nPaused from Telegram, nothing sent.");
   else if (!(await sendAll(msg.text, { tgButtons: msg.buttons }))) process.exitCode = 1;
 }

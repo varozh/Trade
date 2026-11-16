@@ -16,6 +16,7 @@ const args = process.argv.slice(2);
 const dry = args.includes("--dry");
 const days = Number(args[args.indexOf("--days") + 1]) || 7;
 const ENTRY_H = 12; // a limit entry not reached within this time is considered missed
+const WATCH_ENTRY_H = 24; // watch-list entries are further away, so they get more time
 const RISK = Number(env("SCAN_RISK_MIN_PCT")) || 5;
 
 const D = 864e5, now = Date.now(), from = now - days * D;
@@ -36,8 +37,9 @@ async function outcome(s) {
   const hitEntry = (x) => (long ? x.l <= s.entry : x.h >= s.entry);
   const hitStop = (x) => (long ? x.l <= s.stop : x.h >= s.stop);
   const hitTake = (x) => (long ? x.h >= s.target : x.l <= s.target);
-  const fill = k.findIndex((x) => x.t <= s.ts + ENTRY_H * 3600e3 && hitEntry(x));
-  if (fill < 0) return { ...s, result: k.at(-1)?.t > s.ts + ENTRY_H * 3600e3 ? "missed" : "waiting", r: 0 };
+  const window = (s.watch ? WATCH_ENTRY_H : ENTRY_H) * 3600e3;
+  const fill = k.findIndex((x) => x.t <= s.ts + window && hitEntry(x));
+  if (fill < 0) return { ...s, result: k.at(-1)?.t > s.ts + window ? "missed" : "waiting", r: 0 };
   for (const x of k.slice(fill)) {
     if (hitStop(x)) return { ...s, result: "stop", r: -1 };
     if (hitTake(x)) return { ...s, result: "take", r: s.rr };
@@ -85,7 +87,8 @@ if (!res.length) {
   };
   lines.push("", "━━━━━━━━━━━━");
   group("✅ Сильные", (x) => x.strong);
-  group("🟡 Слабее", (x) => !x.strong);
+  group("🟡 Слабее", (x) => !x.strong && !x.watch);
+  group("⏳ Ожидание", (x) => x.watch);
   group("🟢 Лонги", (x) => x.side === "long");
   group("🔴 Шорты", (x) => x.side === "short");
 
