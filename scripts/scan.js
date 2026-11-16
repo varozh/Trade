@@ -94,6 +94,11 @@ async function analyze(symbol) {
     atr1dPct: (atr(d) / p) * 100, atr4h: atr(h4),
     volRatio7to30: avgVol(-8, -1) / avgVol(-31, -1),
     fundingPct: Number(fr.lastFundingRate) * 100,
+    // Market structure on 4h: nearest swing (2 days) for stops, 7-day extremes for targets.
+    swingHi4h: Math.max(...h4.slice(-12).map((x) => x.h)),
+    swingLo4h: Math.min(...h4.slice(-12).map((x) => x.l)),
+    hi7d4h: Math.max(...h4.slice(-42).map((x) => x.h)),
+    lo7d4h: Math.min(...h4.slice(-42).map((x) => x.l)),
   };
 }
 
@@ -148,64 +153,100 @@ const READY_ATR = 0.75;      // max distance to EMA20 4h, in 4h ATRs
 const MAX_ATR_D = 10;        // skip coins with daily ATR above this %, too wild
 const MIN_VOL_RATIO = 0.5;   // skip coins whose volume dried up (7d vs 30d)
 const MAX_FUNDING = 0.03;    // skip if funding (%) is crowded against the trade
-const MAX_SETUPS = 8;        // keep the message short
+const MAX_SETUPS = 5;        // keep the message short
 
-const SETUPS = {
-  "LONG on pullback to EMA20 4h": { side: "long", title: "🟢 ЛОНГ на откате к EMA20 (4ч)" },
-  "SHORT on bounce to EMA20 4h": { side: "short", title: "🔴 ШОРТ на отскоке к EMA20 (4ч)" },
-};
+// Trade plan settings (override in .env).
+const envNum = (name, def) => (Number.isFinite(+process.env[name]) && process.env[name] !== "" && process.env[name] != null ? +process.env[name] : def);
+const MIN_RR = envNum("SCAN_MIN_RR", 2);          // main list: reward/risk at least 1:MIN_RR
+const MIN_RR_WEAK = envNum("SCAN_MIN_RR_WEAK", 1); // separate list: from 1:MIN_RR_WEAK up to 1:MIN_RR
+const MAX_WEAK = 3;                                // keep the weaker list short
+const RISK_MIN = envNum("SCAN_RISK_MIN_PCT", 5);  // risk per trade, % of deposit (lower bound)
+const RISK_MAX = envNum("SCAN_RISK_MAX_PCT", 15); // risk per trade, % of deposit (upper bound)
+const DEPOSIT = envNum("SCAN_DEPOSIT_USDT", 0);   // deposit in USDT; 0 = show size as % of deposit only
+const STOP_BUFFER_ATR = 0.25; // stop goes this far beyond the swing
+const MIN_STOP_ATR = 1;       // stop never closer than 1 ATR (4h) to entry: inside that is noise
+const ATR_TARGET = 3;         // target in ATRs when there is no structure ahead (price at the extreme)
 
-function readySetup(r) {
-  const setup = SETUPS[signal(r)];
-  if (!setup || r.atr1dPct > MAX_ATR_D || r.volRatio7to30 < MIN_VOL_RATIO) return null;
-  const long = setup.side === "long";
-  // Distance from price to EMA20 in the direction the price must move to reach the entry.
-  const dist = (long ? r.price - r.ema20_4h : r.ema20_4h - r.price) / r.atr4h;
+const SIDES = { "LONG on pullback to EMA20 4h": "long", "SHORT on bounce to EMA20 4h": "short" };
+
+// Entry at EMA20 4h, stop behind the 2-day swing, target at the 7-day extreme.
+function tradePlan(r) {
+  const side = SIDES[signal(r)];
+  if (!side || r.atr1dPct > MAX_ATR_D || r.volRatio7to30 < MIN_VOL_RATIO) return null;
+  const long = side === "long";
+  // Strong only: daily trend must agree with the 4h trend.
+  if (r.trend1d !== (long ? "UP" : "DN")) return null;
+  const a = r.atr4h, entry = r.ema20_4h;
+  // Distance the price must travel to reach the entry, in 4h ATRs.
+  const dist = (long ? r.price - entry : entry - r.price) / a;
   if (dist < 0 || dist > READY_ATR) return null;
   if (long ? r.rsi4h > 65 || r.fundingPct > MAX_FUNDING : r.rsi4h < 35 || r.fundingPct < -MAX_FUNDING) return null;
-  return { ...setup, dist };
+
+  const dir = long ? 1 : -1;
+  const swing = long ? Math.min(r.swingLo4h, entry) : Math.max(r.swingHi4h, entry);
+  let stop = swing - dir * STOP_BUFFER_ATR * a;
+  if (Math.abs(entry - stop) < MIN_STOP_ATR * a) stop = entry - dir * MIN_STOP_ATR * a;
+  let target = long ? r.hi7d4h : r.lo7d4h, tpBy = "структура";
+  if ((target - entry) * dir < 1.5 * a) { target = entry + dir * ATR_TARGET * a; tpBy = "ATR"; }
+  const risk = Math.abs(entry - stop), rr = Math.abs(target - entry) / risk;
+  if (rr < MIN_RR_WEAK) return null;
+  const stopPct = (risk / entry) * 100;
+  return { side, entry, stop, target, tpBy, rr, dist, stopPct };
 }
 
 function vkSummary(results) {
   const ok = results.filter((r) => !r.error);
-  const pct = (x) => (x == null ? "—" : `${x >= 0 ? "+" : ""}${x.toFixed(1)}%`);
+  const pct = (x) => `${x >= 0 ? "+" : ""}${x.toFixed(1)}%`;
   const num = (x) => String(+x.toPrecision(5));
+  const usd = (x) => Math.round(x).toLocaleString("ru-RU");
   const ts = new Date().toLocaleString("ru-RU", { timeZone: "Europe/Moscow", dateStyle: "short", timeStyle: "short" });
-  const dn = ok.filter((r) => r.trend1d === "DN").length;
-  const up = ok.filter((r) => r.trend1d === "UP").length;
-  const lines = [
-    `📊 Скан BingX — ${ts} МСК`,
-    `Монет: ${ok.length} · 📈 рост: ${up} · 📉 падение: ${dn} (дневной тренд)`,
-  ];
-  const ready = ok
-    .map((r) => ({ r, s: readySetup(r) }))
-    .filter((x) => x.s)
-    .sort((a, b) => a.s.dist - b.s.dist)
-    .slice(0, MAX_SETUPS);
-  if (!ready.length) {
-    lines.push("", "━━━━━━━━━━━━", "😴 Готовых входов на ближайшие 1–2 часа нет. Ждём.");
-  }
-  for (const title of Object.values(SETUPS).map((s) => s.title)) {
-    const rs = ready.filter((x) => x.s.title === title);
-    if (!rs.length) continue;
-    lines.push("", "━━━━━━━━━━━━", `${title} — ${rs.length}`, "");
-    for (const { r } of rs) {
-      const toEntry = (r.ema20_4h / r.price - 1) * 100;
-      lines.push(`▪️ ${r.symbol}: ${num(r.price)} $ → вход ~${num(r.ema20_4h)} (${pct(toEntry)})`);
-      lines.push(`     24ч ${pct(r.ch1d)} · 7д ${pct(r.ch7d)} · RSI ${r.rsi4h.toFixed(0)}`);
-    }
-  }
-  const errs = results.filter((r) => r.error);
-  if (errs.length) lines.push("", `❗ Не загрузились: ${errs.map((r) => r.symbol).join(", ")}`);
-  lines.push("", "ℹ️ Только монеты, где цена уже рядом с EMA20 (4ч). Перепроданные, перегретые и неликвидные отсеяны.");
+  const all = ok
+    .map((r) => ({ r, t: tradePlan(r) }))
+    .filter((x) => x.t)
+    .sort((a, b) => b.t.rr - a.t.rr);
+  const strong = all.filter((x) => x.t.rr >= MIN_RR).slice(0, MAX_SETUPS);
+  const weak = all.filter((x) => x.t.rr < MIN_RR).slice(0, MAX_WEAK);
+  if (!strong.length && !weak.length) return null; // nothing worth a message
+
+  const lines = [`📊 Скан BingX — ${ts} МСК`];
+  const section = (title, items) => {
+    if (!items.length) return;
+    lines.push("", `${title} — ${items.length}`);
+    for (const x of items) addPlan(x);
+  };
+  const addPlan = ({ r, t }) => {
+    const p = (x) => pct((x / r.price - 1) * 100);
+    // Position size so that hitting the stop loses exactly riskPct of the deposit.
+    const size = (riskPct) => {
+      const mult = riskPct / t.stopPct; // position value / deposit
+      return DEPOSIT
+        ? `${riskPct}% (${usd((DEPOSIT * riskPct) / 100)} $) → ${usd(DEPOSIT * mult)} $, плечо ×${mult.toFixed(1)}`
+        : `${riskPct}% → ${(mult * 100).toFixed(0)}% депо, плечо ×${mult.toFixed(1)}`;
+    };
+    lines.push(
+      "",
+      "━━━━━━━━━━━━",
+      `${t.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} ${r.symbol} · R:R 1:${t.rr.toFixed(1)}`,
+      `▶️ Вход: ${num(t.entry)} (лимит, ${p(t.entry)} от цены ${num(r.price)})`,
+      `⛔ Стоп: ${num(t.stop)} (${p(t.stop)})`,
+      `🎯 Тейк: ${num(t.target)} (${p(t.target)}, ${t.tpBy})`,
+      `💰 Риск ${size(RISK_MIN)}`,
+      `     Риск ${size(RISK_MAX)}`,
+    );
+  };
+  section(`✅ СИЛЬНЫЕ: R:R от 1:${MIN_RR}`, strong);
+  section(`🟡 СЛАБЕЕ: R:R 1:${MIN_RR_WEAK}–1:${MIN_RR}`, weak);
   return lines.join("\n");
 }
 
-if (args.includes("--vk-dry")) {
-  console.log("\n--- VK message ---\n" + vkSummary(results));
+const vkText = args.some((a) => a.startsWith("--vk")) ? vkSummary(results) : null;
+if (args.some((a) => a.startsWith("--vk")) && !vkText) {
+  console.log(`\nNo setups with R:R >= 1:${MIN_RR_WEAK}, nothing sent.`);
+} else if (args.includes("--vk-dry")) {
+  console.log("\n--- VK message ---\n" + vkText);
 } else if (args.includes("--vk")) {
   try {
-    await sendVk(vkSummary(results));
+    await sendVk(vkText);
     console.log("\nSent to VK.");
   } catch (e) {
     console.error(`\nVK send failed: ${e.message}`);
