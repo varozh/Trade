@@ -2,3 +2,4 @@ node_modules/
 .env
 *.log
 .scan-state.json
+.alerts-state.json

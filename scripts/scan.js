@@ -10,41 +10,14 @@
 //   npm run scan -- --dry             – print that message without sending (--vk-dry is the same)
 import { BingXClient } from "../src/bingx.js";
 import { sendAll } from "../src/notify.js";
+import { toSymbols, pub, klines, sleep } from "../src/quotes.js";
 import { btcDominance, todayEvents, okxLiquidations, TZ, TZ_LABEL } from "../src/market.js";
 import { env } from "../src/env.js";
 
-// Favorites from the BingX account (edit as needed).
-const WATCHLIST = `BTC ETH SOL ZEC XRP 1000PEPE HYPE AVAX AAVE ARB BNB SUI LINK ENA DOGE UNI TAO ADA ASTER
-PUMP ZRO APT TIA OP ETHFI FARTCOIN DASH TRX WIF PENGU STRK LDO USELESS AERO XPL SPX WLFI 1000BONK ZK
-MORPHO MYX ARC MNT FLOKI RATS ANSEM SOON TWT`;
-
+// The watchlist lives in src/quotes.js (shared with the alerts).
 const args = process.argv.slice(2);
 const asJson = args.includes("--json");
-const userSyms = args.filter((a) => !a.startsWith("--"));
-const symbols = (userSyms.length ? userSyms : WATCHLIST.split(/\s+/).filter(Boolean)).map((s) => {
-  const x = s.toUpperCase().replace(/[/_]/g, "-");
-  return x.includes("-") ? x : `${x.replace(/USDT$/, "")}-USDT`;
-});
-
-// Market data always comes from the live API (demo has its own, thinner prices).
-const client = new BingXClient({ demo: false });
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function pub(path, params, tries = 4) {
-  for (let i = 0; ; i++) {
-    try {
-      return await client.get(path, params, { signed: false });
-    } catch (e) {
-      if (i >= tries - 1) throw e;
-      await sleep(1000 * (i + 1)); // rate limit: back off and retry
-    }
-  }
-}
-
-const klines = async (symbol, interval, limit) =>
-  (await pub("/openApi/swap/v3/quote/klines", { symbol, interval, limit }))
-    .map((k) => ({ t: +k.time, h: +k.high, l: +k.low, c: +k.close, v: +k.volume }))
-    .sort((a, b) => a.t - b.t);
+const symbols = toSymbols(args.filter((a) => !a.startsWith("--")));
 
 const ema = (a, n) => {
   const k = 2 / (n + 1);
