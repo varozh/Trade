@@ -10,7 +10,7 @@
 //   npm run scan -- --dry             – print that message without sending (--vk-dry is the same)
 import { BingXClient } from "../src/bingx.js";
 import { sendAll } from "../src/notify.js";
-import { btcDominance, todayEvents, okxLiquidations } from "../src/market.js";
+import { btcDominance, todayEvents, okxLiquidations, TZ, TZ_LABEL } from "../src/market.js";
 import { env } from "../src/env.js";
 
 // Favorites from the BingX account (edit as needed).
@@ -249,7 +249,7 @@ async function vkSummary(results, deposit) {
   const num = (x) => String(+x.toPrecision(5));
   // Whole dollars for big sums, cents for small ones (a small deposit would otherwise show "−0 $").
   const usd = (x) => x.toLocaleString("ru-RU", { maximumFractionDigits: Math.abs(x) < 100 ? 2 : 0 });
-  const ts = new Date().toLocaleString("ru-RU", { timeZone: "Europe/Moscow", dateStyle: "short", timeStyle: "short" });
+  const ts = new Date().toLocaleString("ru-RU", { timeZone: TZ, dateStyle: "short", timeStyle: "short" });
   // Fetched on every run, even with no setups: dominance history for the 24h change builds up from these.
   const [btcd, events] = await Promise.all([safe(btcDominance()), safe(todayEvents({ upcomingOnly: true }))]);
   const btc = ok.find((r) => r.symbol === "BTC");
@@ -265,7 +265,7 @@ async function vkSummary(results, deposit) {
   const weak = all.filter((x) => x.t.rr < MIN_RR || x.mkt === "against").slice(0, MAX_WEAK);
   if (!strong.length && !weak.length) return null; // nothing worth a message
 
-  const lines = [`📊 Скан BingX — ${ts} МСК`];
+  const lines = [`📊 Скан BingX — ${ts} (${TZ_LABEL})`];
   if (DEPOSIT) lines.push(`💼 Депозит: ${usd(DEPOSIT)} $${deposit.source === ".env" ? " (из настроек)" : ""}`);
   if (btcd) {
     const ch = btcd.change24h == null ? "" : ` (${btcd.change24h >= 0 ? "+" : ""}${btcd.change24h.toFixed(2)} за сутки)`;

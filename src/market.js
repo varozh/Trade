@@ -4,6 +4,7 @@
 //   macro calendar – Forex Factory weekly JSON (high-impact USD events: FOMC, CPI, NFP, …)
 //   liquidations   – OKX public liquidation orders (positions already liquidated, not a forecast)
 import { readFileSync, writeFileSync } from "node:fs";
+import { env } from "./env.js";
 
 const STATE_FILE = new URL("../.scan-state.json", import.meta.url);
 const UA = { "User-Agent": "Mozilla/5.0 (bingx-scanner)" };
@@ -45,8 +46,10 @@ export async function btcDominance() {
 
 // ---------- Macro calendar ----------
 
-const MSK = "Europe/Moscow";
-const dayKey = (d) => d.toLocaleDateString("sv-SE", { timeZone: MSK }); // YYYY-MM-DD in Moscow time
+// Time zone for every time shown in messages (and for what "today" means). Override in .env.
+export const TZ = env("SCAN_TZ") || "Europe/Samara";
+export const TZ_LABEL = env("SCAN_TZ_LABEL") || "Самара";
+const dayKey = (d) => d.toLocaleDateString("sv-SE", { timeZone: TZ }); // YYYY-MM-DD in local time
 
 // Russian names for the usual market movers; anything else keeps its original title.
 const EVENT_RU = [
@@ -93,7 +96,7 @@ async function weekEvents() {
   return events;
 }
 
-// Today's (Moscow date) high-impact USD events, time in MSK. upcomingOnly drops those already past.
+// Today's (local date, see TZ) high-impact USD events, time in TZ. upcomingOnly drops those already past.
 export async function todayEvents({ upcomingOnly = false } = {}) {
   const now = new Date(), today = dayKey(now);
   return (await weekEvents())
@@ -101,7 +104,7 @@ export async function todayEvents({ upcomingOnly = false } = {}) {
     .filter((e) => dayKey(e.at) === today && (!upcomingOnly || e.at > now))
     .sort((a, b) => a.at - b.at)
     .map((e) => ({
-      time: e.at.toLocaleTimeString("ru-RU", { timeZone: MSK, hour: "2-digit", minute: "2-digit" }),
+      time: e.at.toLocaleTimeString("ru-RU", { timeZone: TZ, hour: "2-digit", minute: "2-digit" }),
       title: ruTitle(e.title),
       forecast: e.forecast,
       previous: e.previous,
