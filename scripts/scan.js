@@ -11,6 +11,7 @@
 import { BingXClient } from "../src/bingx.js";
 import { sendAll } from "../src/notify.js";
 import { toSymbols, pub, klines, sleep } from "../src/quotes.js";
+import { readJson, writeJson, readSignals, appendSignals, isPaused } from "../src/store.js";
 import { btcDominance, todayEvents, okxLiquidations, TZ, TZ_LABEL } from "../src/market.js";
 import { env } from "../src/env.js";
 
@@ -51,6 +52,7 @@ async function analyze(symbol) {
   const d = await klines(symbol, "1d", 120);
   const h4 = await klines(symbol, "4h", 200);
   const fr = await pub("/openApi/swap/v2/quote/premiumIndex", { symbol });
+  const oi = await pub("/openApi/swap/v2/quote/openInterest", { symbol }).catch(() => null);
   const cd = d.map((x) => x.c), c4 = h4.map((x) => x.c), p = c4.at(-1);
   const e20d = ema(cd, 20).at(-1), e50d = ema(cd, 50).at(-1);
   const e20 = ema(c4, 20).at(-1), e50 = ema(c4, 50).at(-1), e200 = ema(c4, 200).at(-1);
@@ -68,6 +70,7 @@ async function analyze(symbol) {
     vsEma200_4h: (p / e200 - 1) * 100,
     hi30, lo30, pos30: ((p - lo30) / (hi30 - lo30)) * 100,
     atr1dPct: (atr(d) / p) * 100, atr4h: atr(h4),
+    oiUsd: Number(oi?.openInterest) || null, // open interest in USDT
     volRatio7to30: avgVol(-8, -1) / avgVol(-31, -1),
     fundingPct: Number(fr.lastFundingRate) * 100,
     // Market structure on 4h: nearest swing (2 days) for stops, 7-day extremes for targets.
@@ -98,6 +101,20 @@ for (const s of symbols) {
     results.push({ symbol: s, error: e.message });
   }
   await sleep(150);
+}
+
+// Open interest history (data/oi.json), kept 3 days: gives the 24h OI change for every coin.
+{
+  const now = Date.now(), hist = readJson("oi.json", {});
+  for (const r of results) {
+    if (r.error || !r.oiUsd) continue;
+    const h = (hist[r.symbol] ?? []).filter((x) => now - x.t < 72 * 3600e3);
+    const dayAgo = h.filter((x) => now - x.t >= 20 * 3600e3).at(-1);
+    r.oiCh24h = dayAgo ? (r.oiUsd / dayAgo.v - 1) * 100 : null;
+    h.push({ t: now, v: r.oiUsd });
+    hist[r.symbol] = h;
+  }
+  if (args.includes("--send") || args.includes("--vk")) writeJson("oi.json", hist); // dry runs leave history alone
 }
 
 if (asJson) {
@@ -139,6 +156,7 @@ const envNum = (name, def) => {
 const MIN_RR = envNum("SCAN_MIN_RR", 2);          // main list: reward/risk at least 1:MIN_RR
 const MIN_RR_WEAK = envNum("SCAN_MIN_RR_WEAK", 1); // separate list: from 1:MIN_RR_WEAK up to 1:MIN_RR
 const MAX_WEAK = 3;                                // keep the weaker list short
+const REPEAT_H = 24;                               // same coin+direction within this many hours = repeat
 const RISK_MIN = envNum("SCAN_RISK_MIN_PCT", 5);  // risk per trade, % of deposit (lower bound)
 const RISK_MAX = envNum("SCAN_RISK_MAX_PCT", 15); // risk per trade, % of deposit (upper bound)
 const LEVERAGE = envNum("SCAN_LEVERAGE", 30);     // leverage used to open trades: margin = position / leverage
@@ -248,6 +266,24 @@ async function vkSummary(results, deposit) {
   if (regime === "alts-strong") lines.push("📈 Доминация падает, BTC растёт → альты сильнее: шорты по альтам понижены");
   if (events?.length) lines.push(`📅 Сегодня: ${events.map((e) => `${e.time} ${e.title}`).join("; ")}`);
 
+  // Repeat: the same coin and direction was already sent in the last 24h. Still shown, just marked.
+  const now = Date.now();
+  const recent = readSignals().filter((s) => now - s.ts < REPEAT_H * 3600e3);
+  const signals = [...strong, ...weak].map(({ r, t }, i) => ({
+    id: `${now.toString(36)}${i}`,
+    ts: now,
+    symbol: r.symbol,
+    side: t.side,
+    entry: t.entry,
+    stop: t.stop,
+    target: t.target,
+    rr: +t.rr.toFixed(2),
+    stopPct: t.stopPct,
+    strong: i < strong.length,
+    repeat: recent.some((s) => s.symbol === r.symbol && s.side === t.side),
+  }));
+  const sig = new Map(signals.map((s) => [s.symbol, s]));
+
   const liqList = await Promise.all([...strong, ...weak].map(({ r }) => safe(okxLiquidations(r.symbol))));
   const liqs = new Map([...strong, ...weak].map(({ r }, i) => [r.symbol, liqList[i]]));
   const section = (title, items) => {
@@ -273,7 +309,8 @@ async function vkSummary(results, deposit) {
       "",
       "━━━━━━━━━━━━",
       `${t.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} ${r.symbol} · R:R 1:${t.rr.toFixed(1)}` +
-        (mkt === "with" ? " · по рынку" : mkt === "against" ? " · против рынка" : ""),
+        (mkt === "with" ? " · по рынку" : mkt === "against" ? " · против рынка" : "") +
+        (sig.get(r.symbol)?.repeat ? " · 🔁 повтор" : ""),
       `▶️ Вход: ${num(t.entry)}`,
       `⛔ Стоп: ${num(t.stop)}`,
       `🎯 Тейк: ${num(t.target)}`,
@@ -286,20 +323,32 @@ async function vkSummary(results, deposit) {
       const z = lq.zone;
       lines.push(`     макс. зона ${num(z.lo)}–${num(z.hi)} (${z.side === "long" ? "лонги" : "шорты"}, ${compactUsd(z.usd)})`);
     }
+    if (r.oiUsd) {
+      const ch = r.oiCh24h == null ? "" : ` (${r.oiCh24h >= 0 ? "+" : ""}${r.oiCh24h.toFixed(1)}% за сутки)`;
+      lines.push(`📈 Открытый интерес: ${compactUsd(r.oiUsd)}${ch}`);
+    }
   };
   section(`✅ СИЛЬНЫЕ: R:R от 1:${MIN_RR}`, strong);
   section(`🟡 СЛАБЕЕ: R:R 1:${MIN_RR_WEAK}–1:${MIN_RR}${weak.some((x) => x.mkt === "against") ? " или против рынка" : ""}`, weak);
-  return lines.join("\n");
+  // Telegram buttons: open a signal at the lower or upper risk (the bot asks to confirm first).
+  const buttons = signals.map((s) => [
+    { text: `${s.side === "long" ? "🟢" : "🔴"} ${s.symbol} ${RISK_MIN}%`, callback_data: `open:${s.id}:${RISK_MIN}` },
+    { text: `${s.symbol} ${RISK_MAX}%`, callback_data: `open:${s.id}:${RISK_MAX}` },
+  ]);
+  return { text: lines.join("\n"), buttons, signals };
 }
 
 // --send (or the old --vk) sends to every configured messenger; --dry (--vk-dry) only prints.
 const dry = args.includes("--dry") || args.includes("--vk-dry");
 const send = args.includes("--send") || args.includes("--vk");
-const msgText = dry || send ? await vkSummary(results, await fetchDeposit()) : null;
-if ((dry || send) && !msgText) {
+const msg = dry || send ? await vkSummary(results, await fetchDeposit()) : null;
+if ((dry || send) && !msg) {
   console.log(`\nNo setups with R:R >= 1:${MIN_RR_WEAK}, nothing sent.`);
 } else if (dry) {
-  console.log("\n--- message ---\n" + msgText);
+  console.log("\n--- message ---\n" + msg.text);
 } else if (send) {
-  if (!(await sendAll(msgText))) process.exitCode = 1;
+  // Signals are logged even while paused: the weekly statistics should see them.
+  appendSignals(msg.signals);
+  if (isPaused()) console.log("\nPaused from Telegram, nothing sent.");
+  else if (!(await sendAll(msg.text, { tgButtons: msg.buttons }))) process.exitCode = 1;
 }

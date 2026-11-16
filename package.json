@@ -15,7 +15,11 @@
     "events": "node --env-file=.env scripts/events.js",
     "alerts": "node --env-file=.env scripts/alerts.js",
     "journal": "node --env-file=.env scripts/journal.js",
-    "vk:users": "node --env-file=.env scripts/vk-users.js"
+    "vk:users": "node --env-file=.env scripts/vk-users.js",
+    "signal-stats": "node --env-file=.env scripts/signal-stats.js",
+    "top": "node --env-file=.env scripts/top.js",
+    "bot": "node --env-file=.env scripts/bot.js",
+    "cleanup": "node scripts/cleanup.js"
   },
   "license": "MIT",
   "dependencies": {

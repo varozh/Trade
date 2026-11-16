@@ -2,7 +2,7 @@
 // Usage: node scripts/check.js   (reads BINGX_* env vars)
 import { BingXClient } from "../src/bingx.js";
 
-const demo = !/^(0|false|no|off)$/i.test(process.env.BINGX_DEMO ?? "true");
+const demo = /^(1|true|yes|on)$/i.test(process.env.BINGX_DEMO ?? "false"); // real account by default
 const c = new BingXClient({
   apiKey: process.env.BINGX_API_KEY,
   secretKey: process.env.BINGX_SECRET_KEY,

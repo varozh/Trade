@@ -19,9 +19,12 @@ export async function tgCall(method, params = {}, token = env("TG_BOT_TOKEN")) {
   return data.result;
 }
 
-export async function sendTg(text, chatId = env("TG_CHAT_ID")) {
+// buttons: inline keyboard rows, attached to the last part of a long message.
+export async function sendTg(text, chatId = env("TG_CHAT_ID"), buttons) {
   if (!chatId) throw new Error("TG_CHAT_ID is not set");
-  for (const part of splitText(text, MAX_LEN)) {
-    await tgCall("sendMessage", { chat_id: chatId, text: part, disable_web_page_preview: true });
+  const parts = splitText(text, MAX_LEN);
+  for (const [i, part] of parts.entries()) {
+    const markup = buttons?.length && i === parts.length - 1 ? { reply_markup: { inline_keyboard: buttons } } : {};
+    await tgCall("sendMessage", { chat_id: chatId, text: part, disable_web_page_preview: true, ...markup });
   }
 }

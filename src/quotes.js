@@ -1,14 +1,31 @@
 // Public BingX market data shared by the scanner and the alerts: watchlist, candles, retries.
 import { BingXClient } from "./bingx.js";
+import { readJson, writeJson } from "./store.js";
 
 // Favorites from the BingX account (edit as needed): base names without -USDT, separated by spaces.
 export const WATCHLIST = `BTC ETH SOL ZEC XRP 1000PEPE HYPE AVAX AAVE ARB BNB SUI LINK ENA DOGE UNI TAO ADA ASTER
 PUMP ZRO APT TIA OP ETHFI FARTCOIN DASH TRX WIF PENGU STRK LDO USELESS AERO XPL SPX WLFI 1000BONK ZK
 MORPHO MYX ARC MNT FLOKI RATS ANSEM SOON TWT`;
 
+// Changes made from Telegram (/add, /remove) live in data/watchlist.json on top of WATCHLIST,
+// so the server copy can still be updated with git pull.
+export function watchlist() {
+  const extra = readJson("watchlist.json", { added: [], removed: [] });
+  const removed = new Set(extra.removed);
+  return [...new Set([...WATCHLIST.split(/\s+/).filter(Boolean), ...extra.added])].filter((s) => !removed.has(s));
+}
+export function editWatchlist(symbol, add) {
+  const w = readJson("watchlist.json", { added: [], removed: [] });
+  w.added = w.added.filter((s) => s !== symbol);
+  w.removed = w.removed.filter((s) => s !== symbol);
+  if (add && !WATCHLIST.split(/\s+/).includes(symbol)) w.added.push(symbol);
+  if (!add && WATCHLIST.split(/\s+/).includes(symbol)) w.removed.push(symbol);
+  writeJson("watchlist.json", w);
+}
+
 // "sol", "SOLUSDT", "sol/usdt" → "SOL-USDT". No arguments → the whole watchlist.
 export function toSymbols(list) {
-  const src = list.length ? list : WATCHLIST.split(/\s+/).filter(Boolean);
+  const src = list.length ? list : watchlist();
   return src.map((s) => {
     const x = s.toUpperCase().replace(/[/_]/g, "-");
     return x.includes("-") ? x : `${x.replace(/USDT$/, "")}-USDT`;

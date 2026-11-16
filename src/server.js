@@ -3,7 +3,7 @@
 //
 // Env:
 //   BINGX_API_KEY, BINGX_SECRET_KEY   – API credentials
-//   BINGX_DEMO=true|false             – demo (VST) account, default true
+//   BINGX_DEMO=true|false             – demo (VST) account, default false (real account)
 //   BINGX_ENABLE_TRADING=true|false   – allow order/position-changing tools, default false
 //   BINGX_MAX_NOTIONAL_USDT=number    – optional cap on one order's notional value
 //   BINGX_MAX_LEVERAGE=number         – optional cap on leverage
@@ -17,7 +17,7 @@ const bool = (v, d) => (v === undefined || v === "" ? d : /^(1|true|yes|on)$/i.t
 const num = (v) => (v === undefined || v === "" ? undefined : Number(v));
 
 const config = {
-  demo: bool(env.BINGX_DEMO, true),
+  demo: bool(env.BINGX_DEMO, false),
   tradingEnabled: bool(env.BINGX_ENABLE_TRADING, false),
   maxNotional: num(env.BINGX_MAX_NOTIONAL_USDT),
   maxLeverage: num(env.BINGX_MAX_LEVERAGE),

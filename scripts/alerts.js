@@ -13,6 +13,7 @@ import { toSymbols, klines, sleep } from "../src/quotes.js";
 import { sendAll } from "../src/notify.js";
 import { env } from "../src/env.js";
 import { TZ, TZ_LABEL } from "../src/market.js";
+import { isPaused } from "../src/store.js";
 
 const num = (name, def) => {
   const v = env(name);
@@ -109,6 +110,10 @@ const now = Date.now(), state = loadState();
 for (const k of Object.keys(state)) if (now - state[k] > 24 * 3600e3) delete state[k];
 const fresh = alerts.filter((a) => !(now - (state[`${a.symbol}:${a.key}`] ?? 0) < REPEAT_H * 3600e3));
 
+if (isPaused()) {
+  console.log(`${new Date().toISOString()} paused from Telegram, nothing sent.`);
+  process.exit(0);
+}
 if (!fresh.length) {
   console.log(`${new Date().toISOString()} ${alerts.length ? "only repeated alerts" : "no alerts"}, nothing sent.`);
   process.exit(0);

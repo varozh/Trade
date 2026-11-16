@@ -1,12 +1,13 @@
 // Send one text to every configured messenger (VK and/or Telegram, see .env).
 // Each channel on its own: a failure in one must not block the other. Returns true if all succeeded.
+// tgButtons: optional Telegram inline keyboard (rows of {text, callback_data}); VK gets plain text.
 import { sendVk, vkConfigured } from "./vk.js";
 import { sendTg, tgConfigured } from "./tg.js";
 
-export async function sendAll(text) {
+export async function sendAll(text, { tgButtons } = {}) {
   const channels = [
-    ["VK", vkConfigured, sendVk],
-    ["Telegram", tgConfigured, sendTg],
+    ["VK", vkConfigured, (t) => sendVk(t)],
+    ["Telegram", tgConfigured, (t) => sendTg(t, undefined, tgButtons)],
   ].filter(([, configured]) => configured());
   if (!channels.length) {
     console.error("No messenger configured: set VK_TOKEN/VK_USER_ID and/or TG_BOT_TOKEN/TG_CHAT_ID in .env");

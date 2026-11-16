@@ -3,3 +3,5 @@ node_modules/
 *.log
 .scan-state.json
 .alerts-state.json
+data/
+*.log.1
