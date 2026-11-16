@@ -9,8 +9,8 @@
 //                                       VK_TOKEN + VK_USER_ID, TG_BOT_TOKEN + TG_CHAT_ID); --vk is the same
 //   npm run scan -- --dry             – print that message without sending (--vk-dry is the same)
 import { BingXClient } from "../src/bingx.js";
-import { sendVk, vkConfigured } from "../src/vk.js";
-import { sendTg, tgConfigured } from "../src/tg.js";
+import { sendAll } from "../src/notify.js";
+import { btcDominance, todayEvents, okxLiquidations } from "../src/market.js";
 import { env } from "../src/env.js";
 
 // Favorites from the BingX account (edit as needed).
@@ -219,29 +219,70 @@ function tradePlan(r) {
   return { side, entry, stop, target, tpBy, rr, dist, stopPct };
 }
 
-function vkSummary(results, deposit) {
+// BTC dominance filter. Rising dominance while BTC falls: money leaves alts, they fall harder.
+// Falling dominance while BTC rises: alts outrun BTC. Needs ~a day of dominance history on the server.
+const BTCD_PP = envNum("SCAN_BTCD_PP", 0.5);    // dominance change over 24h, percentage points
+const BTC_MOVE = envNum("SCAN_BTC_MOVE_PCT", 0.5); // BTC daily move, %
+
+function altRegime(btcdChange, btcCh1d) {
+  if (btcdChange == null || btcCh1d == null) return null;
+  if (btcdChange >= BTCD_PP && btcCh1d <= -BTC_MOVE) return "alts-weak";
+  if (btcdChange <= -BTCD_PP && btcCh1d >= BTC_MOVE) return "alts-strong";
+  return null;
+}
+
+// "with" – the trade goes the way the regime pushes alts, "against" – the opposite; BTC itself is not affected.
+function regimeTag(regime, symbol, side) {
+  if (!regime || symbol === "BTC") return null;
+  const favoured = regime === "alts-weak" ? "short" : "long";
+  return side === favoured ? "with" : "against";
+}
+
+// Extra context must never break the report: on any error the line is just left out.
+const safe = (p) => p.catch((e) => (console.error(`context: ${e.message}`), null));
+const compactUsd = (x) =>
+  x >= 1e6 ? `${(x / 1e6).toFixed(1)} млн $` : x >= 1e3 ? `${(x / 1e3).toFixed(0)} тыс $` : `${x.toFixed(0)} $`;
+
+async function vkSummary(results, deposit) {
   const DEPOSIT = deposit?.amount ?? 0;
   const ok = results.filter((r) => !r.error);
   const num = (x) => String(+x.toPrecision(5));
   // Whole dollars for big sums, cents for small ones (a small deposit would otherwise show "−0 $").
   const usd = (x) => x.toLocaleString("ru-RU", { maximumFractionDigits: Math.abs(x) < 100 ? 2 : 0 });
   const ts = new Date().toLocaleString("ru-RU", { timeZone: "Europe/Moscow", dateStyle: "short", timeStyle: "short" });
+  // Fetched on every run, even with no setups: dominance history for the 24h change builds up from these.
+  const [btcd, events] = await Promise.all([safe(btcDominance()), safe(todayEvents({ upcomingOnly: true }))]);
+  const btc = ok.find((r) => r.symbol === "BTC");
+  const regime = altRegime(btcd?.change24h, btc?.ch1d);
+
   const all = ok
     .map((r) => ({ r, t: tradePlan(r) }))
     .filter((x) => x.t)
+    .map((x) => ({ ...x, mkt: regimeTag(regime, x.r.symbol, x.t.side) }))
     .sort((a, b) => b.t.rr - a.t.rr);
-  const strong = all.filter((x) => x.t.rr >= MIN_RR).slice(0, MAX_SETUPS);
-  const weak = all.filter((x) => x.t.rr < MIN_RR).slice(0, MAX_WEAK);
+  // Against the market (see altRegime): never in the strong list, whatever the R:R.
+  const strong = all.filter((x) => x.t.rr >= MIN_RR && x.mkt !== "against").slice(0, MAX_SETUPS);
+  const weak = all.filter((x) => x.t.rr < MIN_RR || x.mkt === "against").slice(0, MAX_WEAK);
   if (!strong.length && !weak.length) return null; // nothing worth a message
 
   const lines = [`📊 Скан BingX — ${ts} МСК`];
   if (DEPOSIT) lines.push(`💼 Депозит: ${usd(DEPOSIT)} $${deposit.source === ".env" ? " (из настроек)" : ""}`);
+  if (btcd) {
+    const ch = btcd.change24h == null ? "" : ` (${btcd.change24h >= 0 ? "+" : ""}${btcd.change24h.toFixed(2)} за сутки)`;
+    lines.push(`₿ Доминация BTC: ${btcd.value.toFixed(1)}%${ch}`);
+  }
+  if (regime === "alts-weak") lines.push("📉 Доминация растёт, BTC падает → альты слабее: лонги по альтам понижены");
+  if (regime === "alts-strong") lines.push("📈 Доминация падает, BTC растёт → альты сильнее: шорты по альтам понижены");
+  if (events?.length) lines.push(`📅 Сегодня: ${events.map((e) => `${e.time} ${e.title}`).join("; ")}`);
+
+  const liqList = await Promise.all([...strong, ...weak].map(({ r }) => safe(okxLiquidations(r.symbol))));
+  const liqs = new Map([...strong, ...weak].map(({ r }, i) => [r.symbol, liqList[i]]));
   const section = (title, items) => {
     if (!items.length) return;
     lines.push("", `${title} — ${items.length}`);
     for (const x of items) addPlan(x);
   };
-  const addPlan = ({ r, t }) => {
+  const addPlan = ({ r, t, mkt }) => {
     // Position size so that hitting the stop loses exactly riskPct of the deposit;
     // hitting the take then earns riskPct × R:R. Fees and slippage are not included.
     // Margin = position / leverage: the amount taken from the deposit to open the trade.
@@ -258,44 +299,34 @@ function vkSummary(results, deposit) {
     lines.push(
       "",
       "━━━━━━━━━━━━",
-      `${t.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} ${r.symbol} · R:R 1:${t.rr.toFixed(1)}`,
+      `${t.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} ${r.symbol} · R:R 1:${t.rr.toFixed(1)}` +
+        (mkt === "with" ? " · по рынку" : mkt === "against" ? " · против рынка" : ""),
       `▶️ Вход: ${num(t.entry)}`,
       `⛔ Стоп: ${num(t.stop)}`,
       `🎯 Тейк: ${num(t.target)}`,
       ...size(RISK_MIN),
       ...size(RISK_MAX),
     );
+    const lq = liqs.get(r.symbol);
+    if (lq && (lq.longs || lq.shorts)) {
+      lines.push(`💥 Ликвидации OKX 24ч: лонги ${compactUsd(lq.longs)} · шорты ${compactUsd(lq.shorts)}`);
+      const z = lq.zone;
+      lines.push(`     макс. зона ${num(z.lo)}–${num(z.hi)} (${z.side === "long" ? "лонги" : "шорты"}, ${compactUsd(z.usd)})`);
+    }
   };
   section(`✅ СИЛЬНЫЕ: R:R от 1:${MIN_RR}`, strong);
-  section(`🟡 СЛАБЕЕ: R:R 1:${MIN_RR_WEAK}–1:${MIN_RR}`, weak);
+  section(`🟡 СЛАБЕЕ: R:R 1:${MIN_RR_WEAK}–1:${MIN_RR}${weak.some((x) => x.mkt === "against") ? " или против рынка" : ""}`, weak);
   return lines.join("\n");
 }
 
 // --send (or the old --vk) sends to every configured messenger; --dry (--vk-dry) only prints.
 const dry = args.includes("--dry") || args.includes("--vk-dry");
 const send = args.includes("--send") || args.includes("--vk");
-const msgText = dry || send ? vkSummary(results, await fetchDeposit()) : null;
+const msgText = dry || send ? await vkSummary(results, await fetchDeposit()) : null;
 if ((dry || send) && !msgText) {
   console.log(`\nNo setups with R:R >= 1:${MIN_RR_WEAK}, nothing sent.`);
 } else if (dry) {
   console.log("\n--- message ---\n" + msgText);
 } else if (send) {
-  const channels = [
-    ["VK", vkConfigured, sendVk],
-    ["Telegram", tgConfigured, sendTg],
-  ].filter(([, configured]) => configured());
-  if (!channels.length) {
-    console.error("\nNo messenger configured: set VK_TOKEN/VK_USER_ID and/or TG_BOT_TOKEN/TG_CHAT_ID in .env");
-    process.exitCode = 1;
-  }
-  // Each channel on its own: a failure in one must not block the other.
-  for (const [name, , sendTo] of channels) {
-    try {
-      await sendTo(msgText);
-      console.log(`\nSent to ${name}.`);
-    } catch (e) {
-      console.error(`\n${name} send failed: ${e.message}`);
-      process.exitCode = 1;
-    }
-  }
+  if (!(await sendAll(msgText))) process.exitCode = 1;
 }
