@@ -1,6 +1,6 @@
-// Messenger settings (VK_*, TG_*) from this project's .env win over the process environment:
+// Settings (VK_*, TG_*, BINGX_*, SCAN_*) from this project's .env win over the process environment:
 // other scripts on the same server (e.g. a crontab with its own VK_TOKEN for another community)
-// must not hijack the sender.
+// must not hijack the sender. It also works when the script is started without --env-file.
 import { readFileSync } from "node:fs";
 
 const ownEnv = (() => {
@@ -8,7 +8,7 @@ const ownEnv = (() => {
     const text = readFileSync(new URL("../.env", import.meta.url), "utf8");
     return Object.fromEntries(
       text.split(/\r?\n/)
-        .map((l) => l.match(/^\s*((?:VK|TG)_[A-Z_]+)\s*=\s*["']?(.*?)["']?\s*$/))
+        .map((l) => l.match(/^\s*((?:VK|TG|BINGX|SCAN)_[A-Z_]+)\s*=\s*["']?(.*?)["']?\s*$/))
         .filter(Boolean)
         .map((m) => [m[1], m[2]]),
     );

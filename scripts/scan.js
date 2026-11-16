@@ -11,6 +11,7 @@
 import { BingXClient } from "../src/bingx.js";
 import { sendVk, vkConfigured } from "../src/vk.js";
 import { sendTg, tgConfigured } from "../src/tg.js";
+import { env } from "../src/env.js";
 
 // Favorites from the BingX account (edit as needed).
 const WATCHLIST = `BTC ETH SOL ZEC XRP 1000PEPE HYPE AVAX AAVE ARB BNB SUI LINK ENA DOGE UNI TAO ADA ASTER
@@ -158,13 +159,35 @@ const MAX_FUNDING = 0.03;    // skip if funding (%) is crowded against the trade
 const MAX_SETUPS = 5;        // keep the message short
 
 // Trade plan settings (override in .env).
-const envNum = (name, def) => (Number.isFinite(+process.env[name]) && process.env[name] !== "" && process.env[name] != null ? +process.env[name] : def);
+const envNum = (name, def) => {
+  const v = env(name);
+  return v != null && v !== "" && Number.isFinite(+v) ? +v : def;
+};
 const MIN_RR = envNum("SCAN_MIN_RR", 2);          // main list: reward/risk at least 1:MIN_RR
 const MIN_RR_WEAK = envNum("SCAN_MIN_RR_WEAK", 1); // separate list: from 1:MIN_RR_WEAK up to 1:MIN_RR
 const MAX_WEAK = 3;                                // keep the weaker list short
 const RISK_MIN = envNum("SCAN_RISK_MIN_PCT", 5);  // risk per trade, % of deposit (lower bound)
 const RISK_MAX = envNum("SCAN_RISK_MAX_PCT", 15); // risk per trade, % of deposit (upper bound)
-const DEPOSIT = envNum("SCAN_DEPOSIT_USDT", 0);   // deposit in USDT; 0 = show size as % of deposit only
+const LEVERAGE = envNum("SCAN_LEVERAGE", 30);     // leverage used to open trades: margin = position / leverage
+// Deposit: futures account equity read from BingX on every run (needs BINGX_API_KEY / BINGX_SECRET_KEY,
+// a read-only key is enough). Falls back to SCAN_DEPOSIT_USDT, then to sizes in % of deposit.
+async function fetchDeposit() {
+  const apiKey = env("BINGX_API_KEY"), secretKey = env("BINGX_SECRET_KEY");
+  if (apiKey && secretKey) {
+    try {
+      const acc = new BingXClient({ apiKey, secretKey, demo: /^true$/i.test(env("BINGX_DEMO") ?? "false") });
+      const data = await acc.get("/openApi/swap/v3/user/balance", {});
+      const usdt = [data].flat().find((x) => x?.asset === "USDT" || x?.asset === "VST");
+      const equity = Number(usdt?.equity);
+      if (equity > 0) return { amount: equity, source: "BingX" };
+      console.error("BingX balance: no USDT equity in the response");
+    } catch (e) {
+      console.error(`BingX balance failed: ${e.message}`);
+    }
+  }
+  const manual = envNum("SCAN_DEPOSIT_USDT", 0);
+  return manual > 0 ? { amount: manual, source: ".env" } : null;
+}
 const STOP_BUFFER_ATR = 0.25; // stop goes this far beyond the swing
 const MIN_STOP_ATR = 1;       // stop never closer than 1 ATR (4h) to entry: inside that is noise
 const ATR_TARGET = 3;         // target in ATRs when there is no structure ahead (price at the extreme)
@@ -196,11 +219,12 @@ function tradePlan(r) {
   return { side, entry, stop, target, tpBy, rr, dist, stopPct };
 }
 
-function vkSummary(results) {
+function vkSummary(results, deposit) {
+  const DEPOSIT = deposit?.amount ?? 0;
   const ok = results.filter((r) => !r.error);
-  const pct = (x) => `${x >= 0 ? "+" : ""}${x.toFixed(1)}%`;
   const num = (x) => String(+x.toPrecision(5));
-  const usd = (x) => Math.round(x).toLocaleString("ru-RU");
+  // Whole dollars for big sums, cents for small ones (a small deposit would otherwise show "−0 $").
+  const usd = (x) => x.toLocaleString("ru-RU", { maximumFractionDigits: Math.abs(x) < 100 ? 2 : 0 });
   const ts = new Date().toLocaleString("ru-RU", { timeZone: "Europe/Moscow", dateStyle: "short", timeStyle: "short" });
   const all = ok
     .map((r) => ({ r, t: tradePlan(r) }))
@@ -211,29 +235,35 @@ function vkSummary(results) {
   if (!strong.length && !weak.length) return null; // nothing worth a message
 
   const lines = [`📊 Скан BingX — ${ts} МСК`];
+  if (DEPOSIT) lines.push(`💼 Депозит: ${usd(DEPOSIT)} $${deposit.source === ".env" ? " (из настроек)" : ""}`);
   const section = (title, items) => {
     if (!items.length) return;
     lines.push("", `${title} — ${items.length}`);
     for (const x of items) addPlan(x);
   };
   const addPlan = ({ r, t }) => {
-    const p = (x) => pct((x / r.price - 1) * 100);
-    // Position size so that hitting the stop loses exactly riskPct of the deposit.
+    // Position size so that hitting the stop loses exactly riskPct of the deposit;
+    // hitting the take then earns riskPct × R:R. Fees and slippage are not included.
+    // Margin = position / leverage: the amount taken from the deposit to open the trade.
     const size = (riskPct) => {
       const mult = riskPct / t.stopPct; // position value / deposit
+      const gainPct = riskPct * t.rr;
+      const short = mult / LEVERAGE > 1 ? " ⚠️ не хватает депозита" : "";
       return DEPOSIT
-        ? `${riskPct}% (${usd((DEPOSIT * riskPct) / 100)} $) → ${usd(DEPOSIT * mult)} $, плечо ×${mult.toFixed(1)}`
-        : `${riskPct}% → ${(mult * 100).toFixed(0)}% депо, плечо ×${mult.toFixed(1)}`;
+        ? [`💰 Риск ${riskPct}%: маржа ${usd((DEPOSIT * mult) / LEVERAGE)} $ ×${LEVERAGE} = позиция ${usd(DEPOSIT * mult)} $${short}`,
+           `     ⛔ стоп: −${usd((DEPOSIT * riskPct) / 100)} $ · 🎯 тейк: +${usd((DEPOSIT * gainPct) / 100)} $`]
+        : [`💰 Риск ${riskPct}%: маржа ${((mult / LEVERAGE) * 100).toFixed(1)}% депо ×${LEVERAGE}${short}`,
+           `     ⛔ стоп: −${riskPct}% депо · 🎯 тейк: +${gainPct.toFixed(0)}% депо`];
     };
     lines.push(
       "",
       "━━━━━━━━━━━━",
       `${t.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} ${r.symbol} · R:R 1:${t.rr.toFixed(1)}`,
-      `▶️ Вход: ${num(t.entry)} (лимит, ${p(t.entry)} от цены ${num(r.price)})`,
-      `⛔ Стоп: ${num(t.stop)} (${p(t.stop)})`,
-      `🎯 Тейк: ${num(t.target)} (${p(t.target)}, ${t.tpBy})`,
-      `💰 Риск ${size(RISK_MIN)}`,
-      `     Риск ${size(RISK_MAX)}`,
+      `▶️ Вход: ${num(t.entry)}`,
+      `⛔ Стоп: ${num(t.stop)}`,
+      `🎯 Тейк: ${num(t.target)}`,
+      ...size(RISK_MIN),
+      ...size(RISK_MAX),
     );
   };
   section(`✅ СИЛЬНЫЕ: R:R от 1:${MIN_RR}`, strong);
@@ -244,7 +274,7 @@ function vkSummary(results) {
 // --send (or the old --vk) sends to every configured messenger; --dry (--vk-dry) only prints.
 const dry = args.includes("--dry") || args.includes("--vk-dry");
 const send = args.includes("--send") || args.includes("--vk");
-const msgText = dry || send ? vkSummary(results) : null;
+const msgText = dry || send ? vkSummary(results, await fetchDeposit()) : null;
 if ((dry || send) && !msgText) {
   console.log(`\nNo setups with R:R >= 1:${MIN_RR_WEAK}, nothing sent.`);
 } else if (dry) {
