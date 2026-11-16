@@ -5,10 +5,12 @@
 //   npm run scan                      – scan the default watchlist (WATCHLIST below)
 //   npm run scan -- BTC ETH SOL       – scan given symbols
 //   npm run scan -- --json            – raw JSON instead of a table
-//   npm run scan -- --vk              – also send a short summary to VK (needs VK_TOKEN, VK_USER_ID)
-//   npm run scan -- --vk-dry          – print that VK summary without sending
+//   npm run scan -- --send            – also send trade plans to VK and Telegram (whichever is set in .env:
+//                                       VK_TOKEN + VK_USER_ID, TG_BOT_TOKEN + TG_CHAT_ID); --vk is the same
+//   npm run scan -- --dry             – print that message without sending (--vk-dry is the same)
 import { BingXClient } from "../src/bingx.js";
-import { sendVk } from "../src/vk.js";
+import { sendVk, vkConfigured } from "../src/vk.js";
+import { sendTg, tgConfigured } from "../src/tg.js";
 
 // Favorites from the BingX account (edit as needed).
 const WATCHLIST = `BTC ETH SOL ZEC XRP 1000PEPE HYPE AVAX AAVE ARB BNB SUI LINK ENA DOGE UNI TAO ADA ASTER
@@ -239,17 +241,31 @@ function vkSummary(results) {
   return lines.join("\n");
 }
 
-const vkText = args.some((a) => a.startsWith("--vk")) ? vkSummary(results) : null;
-if (args.some((a) => a.startsWith("--vk")) && !vkText) {
+// --send (or the old --vk) sends to every configured messenger; --dry (--vk-dry) only prints.
+const dry = args.includes("--dry") || args.includes("--vk-dry");
+const send = args.includes("--send") || args.includes("--vk");
+const msgText = dry || send ? vkSummary(results) : null;
+if ((dry || send) && !msgText) {
   console.log(`\nNo setups with R:R >= 1:${MIN_RR_WEAK}, nothing sent.`);
-} else if (args.includes("--vk-dry")) {
-  console.log("\n--- VK message ---\n" + vkText);
-} else if (args.includes("--vk")) {
-  try {
-    await sendVk(vkText);
-    console.log("\nSent to VK.");
-  } catch (e) {
-    console.error(`\nVK send failed: ${e.message}`);
+} else if (dry) {
+  console.log("\n--- message ---\n" + msgText);
+} else if (send) {
+  const channels = [
+    ["VK", vkConfigured, sendVk],
+    ["Telegram", tgConfigured, sendTg],
+  ].filter(([, configured]) => configured());
+  if (!channels.length) {
+    console.error("\nNo messenger configured: set VK_TOKEN/VK_USER_ID and/or TG_BOT_TOKEN/TG_CHAT_ID in .env");
     process.exitCode = 1;
+  }
+  // Each channel on its own: a failure in one must not block the other.
+  for (const [name, , sendTo] of channels) {
+    try {
+      await sendTo(msgText);
+      console.log(`\nSent to ${name}.`);
+    } catch (e) {
+      console.error(`\n${name} send failed: ${e.message}`);
+      process.exitCode = 1;
+    }
   }
 }

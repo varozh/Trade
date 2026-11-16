@@ -11,10 +11,8 @@
     "start": "node src/server.js",
     "check": "node scripts/check.js",
     "scan": "node scripts/scan.js",
-    "scan:vk": "node --env-file=.env scripts/scan.js --vk",
-    "vk:users": "node --env-file=.env scripts/vk-users.js",
-    "tg:hello": "node --env-file=.env scripts/tg-hello.js",
-    "tg:chat-id": "node --env-file=.env scripts/tg-hello.js --chat-id"
+    "scan:send": "node --env-file=.env scripts/scan.js --send",
+    "vk:users": "node --env-file=.env scripts/vk-users.js"
   },
   "license": "MIT",
   "dependencies": {
