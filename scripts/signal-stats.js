@@ -37,7 +37,7 @@ async function outcome(s) {
   const hitEntry = (x) => (long ? x.l <= s.entry : x.h >= s.entry);
   const hitStop = (x) => (long ? x.l <= s.stop : x.h >= s.stop);
   const hitTake = (x) => (long ? x.h >= s.target : x.l <= s.target);
-  const window = (s.watch ? WATCH_ENTRY_H : ENTRY_H) * 3600e3;
+  const window = (s.watch || s.retest ? WATCH_ENTRY_H : ENTRY_H) * 3600e3;
   const fill = k.findIndex((x) => x.t <= s.ts + window && hitEntry(x));
   if (fill < 0) return { ...s, result: k.at(-1)?.t > s.ts + window ? "missed" : "waiting", r: 0 };
   for (const x of k.slice(fill)) {
@@ -87,7 +87,8 @@ if (!res.length) {
   };
   lines.push("", "━━━━━━━━━━━━");
   group("✅ Сильные", (x) => x.strong);
-  group("🟡 Слабее", (x) => !x.strong && !x.watch);
+  group("🟡 Слабее", (x) => !x.strong && !x.watch && !x.bounce);
+  group("↩️ Отскок от уровня", (x) => x.bounce);
   group("⏳ Ожидание", (x) => x.watch);
   group("🟢 Лонги", (x) => x.side === "long");
   group("🔴 Шорты", (x) => x.side === "short");

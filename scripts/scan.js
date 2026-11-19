@@ -49,6 +49,43 @@ function atr(k, n = 14) {
 
 const trend = (p, fast, slow) => (p > fast && fast > slow ? "UP" : p < fast && fast < slow ? "DN" : "MIX");
 
+// Horizontal levels: swing highs and lows (fractals, `side` candles each way) on 1d and 4h,
+// merged into zones when closer than `tol`. A level is stronger the more swings it gathers
+// (highs and lows both count: old support becomes resistance); the 120-day and 30-day extremes get a bonus.
+function pivots(k, side) {
+  const out = [];
+  for (let i = side; i < k.length - side; i++) {
+    const w = k.slice(i - side, i + side + 1);
+    if (k[i].h === Math.max(...w.map((x) => x.h))) out.push(k[i].h);
+    if (k[i].l === Math.min(...w.map((x) => x.l))) out.push(k[i].l);
+  }
+  return out;
+}
+
+function findLevels(d, h4, tol) {
+  // The last 4h candles are the bounce itself: they must not make the level they bounce from.
+  const pts = [...pivots(d.slice(0, -1), 3).map((v) => ({ v, w: 1.5 })), ...pivots(h4.slice(0, -6), 3).map((v) => ({ v, w: 1 }))]
+    .sort((a, b) => a.v - b.v);
+  const zones = [];
+  for (const p of pts) {
+    const z = zones.at(-1);
+    if (z && p.v - z.vals[0] <= tol) z.vals.push(p.v), (z.score += p.w);
+    else zones.push({ vals: [p.v], score: p.w });
+  }
+  const old = d.slice(0, -1), last30 = old.slice(-30);
+  const ext = [
+    [Math.min(...old.map((x) => x.l)), 2, "мин. 4 мес."], [Math.max(...old.map((x) => x.h)), 2, "макс. 4 мес."],
+    [Math.min(...last30.map((x) => x.l)), 1, "мин. 30 дней"], [Math.max(...last30.map((x) => x.h)), 1, "макс. 30 дней"],
+  ];
+  return zones.map((z) => {
+    const v = z.vals.reduce((a, b) => a + b, 0) / z.vals.length;
+    const tags = [`${z.vals.length} касан.`];
+    let score = z.score;
+    for (const [e, bonus, name] of ext) if (Math.abs(e - v) <= tol) (score += bonus), tags.push(name);
+    return { v, score, touches: z.vals.length, tags: tags.join(", ") };
+  });
+}
+
 async function analyze(symbol) {
   const d = await klines(symbol, "1d", 120);
   const h4 = await klines(symbol, "4h", 200);
@@ -79,6 +116,11 @@ async function analyze(symbol) {
     swingLo4h: Math.min(...h4.slice(-12).map((x) => x.l)),
     hi7d4h: Math.max(...h4.slice(-42).map((x) => x.h)),
     lo7d4h: Math.min(...h4.slice(-42).map((x) => x.l)),
+    // Bounce setups: strong horizontal levels and the last day of 4h candles (6 candles, the last still forming).
+    levels: findLevels(d, h4, 0.35 * atr(d)).filter((x) => x.score >= 3),
+    lo1d4h: Math.min(...h4.slice(-6).map((x) => x.l)),
+    hi1d4h: Math.max(...h4.slice(-6).map((x) => x.h)),
+    close4h: c4.at(-2), // last closed 4h candle
   };
 }
 
@@ -188,6 +230,63 @@ const ATR_TARGET = 3;         // target in ATRs when there is no structure ahead
 
 const SIDES = { "LONG on pullback to EMA20 4h": "long", "SHORT on bounce to EMA20 4h": "short" };
 
+// Bounce from a strong level (works against the trend too): in the last day the price came to a strong
+// horizontal level (see findLevels), the last closed 4h candle closed back on the right side of it,
+// and the price has already moved away from the extreme. Entry now, stop behind the extreme of the touch,
+// target at the nearest obstacle (EMA 4h or another level).
+const BOUNCE_MIN_SCORE = envNum("SCAN_BOUNCE_MIN_SCORE", 4); // level strength, see findLevels
+const BOUNCE_MIN_RR = envNum("SCAN_BOUNCE_MIN_RR", 1.5);
+const BOUNCE_TOUCH_ATR = 0.5; // the day's extreme came at least this close to the level (4h ATRs)
+const BOUNCE_PIERCE_ATR = 1;  // a wick through the level up to this deep still counts as a test
+const BOUNCE_MIN_MOVE = 0.5;  // the price already moved this far off the extreme: the bounce has started
+const BOUNCE_MAX_DIST = 1.5;  // ...but is no further than this from the level, or the market entry is late
+const BOUNCE_RETEST_ATR = 0.25; // retest limit order this far above (long) / below (short) the level
+const MAX_BOUNCE = 4;
+
+function bouncePlan(r) {
+  if (r.atr1dPct > MAX_ATR_D || r.volRatio7to30 < MIN_VOL_RATIO || !r.levels?.length) return null;
+  const a = r.atr4h, p = r.price;
+  const plans = [];
+  for (const side of ["long", "short"]) {
+    const dir = side === "long" ? 1 : -1;
+    if (side === "long" ? r.fundingPct > MAX_FUNDING : r.fundingPct < -MAX_FUNDING) continue;
+    const ext = side === "long" ? r.lo1d4h : r.hi1d4h;
+    // Nearest strong level under the price (long) / above it (short) that the day's extreme tested.
+    const lvl = r.levels
+      .filter((l) => l.score >= BOUNCE_MIN_SCORE && (p - l.v) * dir > 0)
+      .sort((x, y) => (p - x.v) * dir - (p - y.v) * dir)
+      .find((l) => (ext - l.v) * dir <= BOUNCE_TOUCH_ATR * a && (l.v - ext) * dir <= BOUNCE_PIERCE_ATR * a);
+    if (!lvl) continue;
+    if ((r.close4h - lvl.v) * dir <= 0) continue; // the 4h candle has not closed back beyond the level
+    if ((p - ext) * dir < BOUNCE_MIN_MOVE * a) continue; // no bounce yet
+    // Behind both the level and the wick of the test.
+    const stop0 = (side === "long" ? Math.min(ext, lvl.v) : Math.max(ext, lvl.v)) - dir * STOP_BUFFER_ATR * a;
+    const plan = (entry, retest) => {
+      let stop = stop0;
+      if (Math.abs(entry - stop) < MIN_STOP_ATR * a) stop = entry - dir * MIN_STOP_ATR * a;
+      const risk = Math.abs(entry - stop);
+      // The first obstacle ahead is the target: an EMA 4h or any level at least 1 ATR away.
+      const ahead = [[r.ema20_4h, "EMA20 4ч"], [r.ema50_4h, "EMA50 4ч"], [r.ema200_4h, "EMA200 4ч"], ...r.levels.map((l) => [l.v, "уровень"])]
+        .filter(([v]) => (v - entry) * dir >= a)
+        .sort((x, y) => (x[0] - entry) * dir - (y[0] - entry) * dir)[0];
+      const [target, tpBy] = ahead ?? [entry + dir * ATR_TARGET * a, "ATR"];
+      const rr = Math.abs(target - entry) / risk;
+      return {
+        side, entry, stop, target, tpBy, rr, retest, dist: (p - entry) * dir / a, stopPct: (risk / entry) * 100,
+        level: lvl.v, levelTags: lvl.tags, levelScore: lvl.score,
+        counter: r.trend1d === (side === "long" ? "DN" : "UP"), // against the daily trend
+      };
+    };
+    // Entry at the market while the price is still near the level; otherwise (or when the first obstacle
+    // is too close for that) a limit order on a retest of the level, just above it (long) / below it (short).
+    const now = (p - lvl.v) * dir <= BOUNCE_MAX_DIST * a ? plan(p, false) : null;
+    const best = now?.rr >= BOUNCE_MIN_RR ? now : plan(lvl.v + dir * BOUNCE_RETEST_ATR * a, true);
+    if (best.rr < BOUNCE_MIN_RR || best.dist > MAX_WATCH_ATR) continue;
+    plans.push(best);
+  }
+  return plans.sort((x, y) => y.levelScore - x.levelScore)[0] ?? null;
+}
+
 // Entry at EMA20 4h, stop behind the 2-day swing, target at the 7-day extreme.
 function tradePlan(r) {
   const side = SIDES[signal(r)];
@@ -261,15 +360,24 @@ async function vkSummary(results, deposit) {
   // Against the market (see altRegime): never in the strong list, whatever the R:R.
   const strong = all.filter((x) => x.t.rr >= MIN_RR && x.mkt !== "against").slice(0, MAX_SETUPS);
   const weak = all.filter((x) => x.t.rr < MIN_RR || x.mkt === "against").slice(0, MAX_WEAK);
-  // Watch list: good setups whose entry is still far away — a limit order can wait there.
+  // Bounces from strong levels (may go against the trend): a section of its own, every coin is checked,
+  // also those already in the trend lists above (a coin can be a trend short and a bounce long at once).
   const taken = new Set(all.map((x) => x.r.symbol));
+  const bounce = ok
+    .map((r) => ({ r, t: bouncePlan(r) }))
+    .filter((x) => x.t)
+    .map((x) => ({ ...x, mkt: regimeTag(regime, x.r.symbol, x.t.side) }))
+    .sort((a, b) => b.t.levelScore - a.t.levelScore)
+    .slice(0, MAX_BOUNCE);
+  for (const x of bounce) taken.add(x.r.symbol);
+  // Watch list: good setups whose entry is still far away — a limit order can wait there.
   const watch = ok
     .filter((r) => !taken.has(r.symbol))
     .map((r) => ({ r, t: watchPlan(r) }))
     .filter((x) => x.t && regimeTag(regime, x.r.symbol, x.t.side) !== "against")
     .sort((a, b) => a.t.dist - b.t.dist)
     .slice(0, MAX_WATCH);
-  if (!strong.length && !weak.length) {
+  if (!strong.length && !weak.length && !bounce.length) {
     // Only the watch list: send it when it changed since the last message, not every 2 hours.
     const key = watch.map((x) => `${x.r.symbol}:${x.t.side}`).sort().join(",");
     if (!watch.length || key === readJson("watch-last.json", {}).key) return null;
@@ -288,7 +396,9 @@ async function vkSummary(results, deposit) {
   // Repeat: the same coin and direction was already sent in the last 24h. Still shown, just marked.
   const now = Date.now();
   const recent = readSignals().filter((s) => !s.manual && now - s.ts < REPEAT_H * 3600e3);
-  const signals = [...strong, ...weak, ...watch].map(({ r, t }, i) => ({
+  const kind = (i) => (i < strong.length ? "strong" : i < strong.length + weak.length ? "weak" : i < strong.length + weak.length + bounce.length ? "bounce" : "watch");
+  const items = [...strong, ...weak, ...bounce, ...watch];
+  const signals = items.map(({ r, t }, i) => ({
     id: `${now.toString(36)}${i}`,
     ts: now,
     symbol: r.symbol,
@@ -298,20 +408,24 @@ async function vkSummary(results, deposit) {
     target: t.target,
     rr: +t.rr.toFixed(2),
     stopPct: t.stopPct,
-    strong: i < strong.length,
-    ...(i >= strong.length + weak.length ? { watch: true } : {}),
-    repeat: recent.some((s) => s.symbol === r.symbol && s.side === t.side),
+    strong: kind(i) === "strong",
+    ...(kind(i) === "watch" ? { watch: true } : {}),
+    ...(kind(i) === "bounce" ? { bounce: true, level: t.level, ...(t.retest ? { retest: true } : {}) } : {}),
+    // Bounce and trend signals are different ideas: a repeat only within the same kind.
+    repeat: recent.some((s) => s.symbol === r.symbol && s.side === t.side && !!s.bounce === (kind(i) === "bounce")),
   }));
-  const sig = new Map(signals.map((s) => [s.symbol, s]));
+  const sig = new Map(items.map((x, i) => [x, signals[i]])); // by list item: a coin may be in two lists
 
-  const liqList = await Promise.all([...strong, ...weak].map(({ r }) => safe(okxLiquidations(r.symbol))));
-  const liqs = new Map([...strong, ...weak].map(({ r }, i) => [r.symbol, liqList[i]]));
+  const liqSyms = [...new Set([...strong, ...weak, ...bounce].map(({ r }) => r.symbol))];
+  const liqList = await Promise.all(liqSyms.map((s) => safe(okxLiquidations(s))));
+  const liqs = new Map(liqSyms.map((s, i) => [s, liqList[i]]));
   const section = (title, items) => {
     if (!items.length) return;
     lines.push("", `${title} — ${items.length}`);
     for (const x of items) addPlan(x);
   };
-  const addPlan = ({ r, t, mkt }) => {
+  const addPlan = (item) => {
+    const { r, t, mkt } = item;
     // Position size so that hitting the stop loses exactly riskPct of the deposit;
     // hitting the take then earns riskPct × R:R. Fees and slippage are not included.
     // Margin = position / leverage: the amount taken from the deposit to open the trade.
@@ -330,8 +444,10 @@ async function vkSummary(results, deposit) {
       "━━━━━━━━━━━━",
       `${t.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} ${r.symbol} · R:R 1:${t.rr.toFixed(1)}` +
         (mkt === "with" ? " · по рынку" : mkt === "against" ? " · против рынка" : "") +
-        (sig.get(r.symbol)?.repeat ? " · 🔁 повтор" : ""),
-      `▶️ Вход: ${num(t.entry)}`,
+        (t.counter ? " · ⚠️ против тренда" : "") +
+        (sig.get(item)?.repeat ? " · 🔁 повтор" : ""),
+      ...(t.level ? [`📍 Уровень ${num(t.level)} (${t.levelTags}) · тейк: ${t.tpBy}`] : []),
+      `▶️ Вход: ${num(t.entry)}${t.level ? (t.retest ? " (лимит на ретест уровня)" : " (по рынку)") : ""}`,
       `⛔ Стоп: ${num(t.stop)}`,
       `🎯 Тейк: ${num(t.target)}`,
       ...size(RISK_MIN),
@@ -350,20 +466,22 @@ async function vkSummary(results, deposit) {
   };
   section(`✅ СИЛЬНЫЕ: R:R от 1:${MIN_RR}`, strong);
   section(`🟡 СЛАБЕЕ: R:R 1:${MIN_RR_WEAK}–1:${MIN_RR}${weak.some((x) => x.mkt === "against") ? " или против рынка" : ""}`, weak);
+  section("↩️ ОТСКОК ОТ СИЛЬНОГО УРОВНЯ", bounce);
   if (watch.length) {
     lines.push("", "━━━━━━━━━━━━", `⏳ ЖДЁМ ОТСКОКА К ВХОДУ — ${watch.length}`, "Лимитный ордер можно выставить заранее:", "");
-    for (const { r, t } of watch) {
+    for (const item of watch) {
+      const { r, t } = item;
       const to = (t.entry / r.price - 1) * 100;
       lines.push(
         `${t.side === "long" ? "🟢" : "🔴"} ${r.symbol}: вход ${num(t.entry)} (${to >= 0 ? "+" : "−"}${Math.abs(to).toFixed(1)}%) · R:R 1:${t.rr.toFixed(1)}` +
-          (sig.get(r.symbol)?.repeat ? " · 🔁" : ""),
+          (sig.get(item)?.repeat ? " · 🔁" : ""),
         `     ⛔ ${num(t.stop)} · 🎯 ${num(t.target)}`,
       );
     }
   }
   // Telegram buttons: open a signal at the lower or upper risk (the bot asks to confirm first).
   const buttons = signals.map((s) => [
-    { text: `${s.watch ? "⏳" : s.side === "long" ? "🟢" : "🔴"} ${s.symbol} ${RISK_MIN}%`, callback_data: `open:${s.id}:${RISK_MIN}` },
+    { text: `${s.watch ? "⏳" : s.bounce ? "↩️" : s.side === "long" ? "🟢" : "🔴"} ${s.symbol} ${RISK_MIN}%`, callback_data: `open:${s.id}:${RISK_MIN}` },
     { text: `${s.symbol} ${RISK_MAX}%`, callback_data: `open:${s.id}:${RISK_MAX}` },
   ]);
   const watchKey = watch.map((x) => `${x.r.symbol}:${x.t.side}`).sort().join(",");
@@ -532,6 +650,22 @@ async function coinReports() {
         if (!dry) appendSignals([s]);
         buttons = [[RISK_MIN, RISK_MAX].map((k) => ({ text: `${side === "long" ? "🟢" : "🔴"} ${r.symbol} ${k}%`, callback_data: `open:${s.id}:${k}` }))];
       }
+    }
+    // Bounce from a strong level, the scanner's second setup.
+    const b = bouncePlan(r);
+    if (b) {
+      L.push(
+        "",
+        `↩️ Отскок от уровня ${n(b.level)} (${b.levelTags}): ${b.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} · R:R 1:${b.rr.toFixed(1)}` +
+          (b.counter ? " · ⚠️ против тренда" : ""),
+        `▶️ Вход: ${n(b.entry)} (${b.retest ? "лимит на ретест" : "по рынку"}) · ⛔ Стоп: ${n(b.stop)} · 🎯 Тейк: ${n(b.target)} (${b.tpBy})`,
+      );
+      const s = {
+        id: `${Date.now().toString(36)}b`, ts: Date.now(), symbol: r.symbol, side: b.side, entry: b.entry, stop: b.stop,
+        target: b.target, rr: +b.rr.toFixed(2), stopPct: b.stopPct, strong: false, bounce: true, level: b.level, ...(b.retest ? { retest: true } : {}), repeat: false, manual: true,
+      };
+      if (!dry) appendSignals([s]);
+      buttons = [...(buttons ?? []), [RISK_MIN, RISK_MAX].map((k) => ({ text: `↩️ ${r.symbol} ${k}%`, callback_data: `open:${s.id}:${k}` }))];
     }
     L.push("", "ℹ️ Расчёт по индикаторам, а не гарантия движения.");
     const text = L.join("\n");
