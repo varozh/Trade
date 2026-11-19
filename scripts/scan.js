@@ -49,46 +49,55 @@ function atr(k, n = 14) {
 
 const trend = (p, fast, slow) => (p > fast && fast > slow ? "UP" : p < fast && fast < slow ? "DN" : "MIX");
 
-// Horizontal levels: swing highs and lows (fractals, `side` candles each way) on 1d and 4h,
-// merged into zones when closer than `tol`. A level is stronger the more swings it gathers
-// (highs and lows both count: old support becomes resistance); the 120-day and 30-day extremes get a bonus.
+// Horizontal levels: swing highs and lows (fractals, `side` candles each way) on 1d (LEVEL_DAYS of history)
+// and 4h (about 80 days), merged into zones when closer than `tol`. A level is stronger the more swings it
+// gathers (highs and lows both count: old support becomes resistance); the extremes of the whole history,
+// of 120 days and of 30 days get a bonus. The date of the last touch shows whether the level is still alive.
+const LEVEL_DAYS = Math.min(1400, Math.max(120, Number(process.env.SCAN_LEVEL_DAYS) || 730));
+const H4_CANDLES = 500;
 function pivots(k, side) {
   const out = [];
   for (let i = side; i < k.length - side; i++) {
     const w = k.slice(i - side, i + side + 1);
-    if (k[i].h === Math.max(...w.map((x) => x.h))) out.push(k[i].h);
-    if (k[i].l === Math.min(...w.map((x) => x.l))) out.push(k[i].l);
+    if (k[i].h === Math.max(...w.map((x) => x.h))) out.push({ v: k[i].h, t: k[i].t });
+    if (k[i].l === Math.min(...w.map((x) => x.l))) out.push({ v: k[i].l, t: k[i].t });
   }
   return out;
 }
+const period = (days) => (days >= 365 ? `${+(days / 365).toFixed(1)} г.` : `${Math.round(days / 30)} мес.`);
+const shortDate = (t) => new Date(t).toLocaleDateString("ru-RU", { timeZone: TZ, day: "2-digit", month: "2-digit", year: "2-digit" });
 
 function findLevels(d, h4, tol) {
   // The last 4h candles are the bounce itself: they must not make the level they bounce from.
-  const pts = [...pivots(d.slice(0, -1), 3).map((v) => ({ v, w: 1.5 })), ...pivots(h4.slice(0, -6), 3).map((v) => ({ v, w: 1 }))]
+  // A 4h swing within the daily history is the same touch seen closer: daily swings use 4 candles each way.
+  const pts = [...pivots(d.slice(0, -1), 4).map((p) => ({ ...p, w: 1.5 })), ...pivots(h4.slice(0, -6), 3).map((p) => ({ ...p, w: 1 }))]
     .sort((a, b) => a.v - b.v);
   const zones = [];
   for (const p of pts) {
     const z = zones.at(-1);
-    if (z && p.v - z.vals[0] <= tol) z.vals.push(p.v), (z.score += p.w);
-    else zones.push({ vals: [p.v], score: p.w });
+    if (z && p.v - z.pts[0].v <= tol) z.pts.push(p), (z.score += p.w);
+    else zones.push({ pts: [p], score: p.w });
   }
-  const old = d.slice(0, -1), last30 = old.slice(-30);
+  const old = d.slice(0, -1);
+  const lo = (k) => Math.min(...k.map((x) => x.l)), hi = (k) => Math.max(...k.map((x) => x.h));
   const ext = [
-    [Math.min(...old.map((x) => x.l)), 2, "мин. 4 мес."], [Math.max(...old.map((x) => x.h)), 2, "макс. 4 мес."],
-    [Math.min(...last30.map((x) => x.l)), 1, "мин. 30 дней"], [Math.max(...last30.map((x) => x.h)), 1, "макс. 30 дней"],
+    [lo(old), 2, `мин. ${period(old.length)}`], [hi(old), 2, `макс. ${period(old.length)}`],
+    ...(old.length > 150 ? [[lo(old.slice(-120)), 1.5, "мин. 4 мес."], [hi(old.slice(-120)), 1.5, "макс. 4 мес."]] : []),
+    [lo(old.slice(-30)), 1, "мин. 30 дней"], [hi(old.slice(-30)), 1, "макс. 30 дней"],
   ];
   return zones.map((z) => {
-    const v = z.vals.reduce((a, b) => a + b, 0) / z.vals.length;
-    const tags = [`${z.vals.length} касан.`];
+    const v = z.pts.reduce((a, p) => a + p.v, 0) / z.pts.length;
+    const last = Math.max(...z.pts.map((p) => p.t));
+    const tags = [`${z.pts.length} касан., посл. ${shortDate(last)}`];
     let score = z.score;
     for (const [e, bonus, name] of ext) if (Math.abs(e - v) <= tol) (score += bonus), tags.push(name);
-    return { v, score, touches: z.vals.length, tags: tags.join(", ") };
+    return { v, score, touches: z.pts.length, lastTouch: last, tags: tags.join(", ") };
   });
 }
 
 async function analyze(symbol) {
-  const d = await klines(symbol, "1d", 120);
-  const h4 = await klines(symbol, "4h", 200);
+  const d = await klines(symbol, "1d", LEVEL_DAYS);
+  const h4 = await klines(symbol, "4h", H4_CANDLES);
   const fr = await pub("/openApi/swap/v2/quote/premiumIndex", { symbol });
   const oi = await pub("/openApi/swap/v2/quote/openInterest", { symbol }).catch(() => null);
   const cd = d.map((x) => x.c), c4 = h4.map((x) => x.c), p = c4.at(-1);
@@ -241,10 +250,11 @@ const BOUNCE_PIERCE_ATR = 1;  // a wick through the level up to this deep still 
 const BOUNCE_MIN_MOVE = 0.5;  // the price already moved this far off the extreme: the bounce has started
 const BOUNCE_MAX_DIST = 1.5;  // ...but is no further than this from the level, or the market entry is late
 const BOUNCE_RETEST_ATR = 0.25; // retest limit order this far above (long) / below (short) the level
-const MAX_BOUNCE = 4;
+const MAX_BOUNCE = 6;
 
-function bouncePlan(r) {
-  if (r.atr1dPct > MAX_ATR_D || r.volRatio7to30 < MIN_VOL_RATIO || !r.levels?.length) return null;
+// Both sides can qualify at once (a range: long from support, short from resistance), so all are returned.
+function bouncePlans(r) {
+  if (r.atr1dPct > MAX_ATR_D || r.volRatio7to30 < MIN_VOL_RATIO || !r.levels?.length) return [];
   const a = r.atr4h, p = r.price;
   const plans = [];
   for (const side of ["long", "short"]) {
@@ -284,7 +294,7 @@ function bouncePlan(r) {
     if (best.rr < BOUNCE_MIN_RR || best.dist > MAX_WATCH_ATR) continue;
     plans.push(best);
   }
-  return plans.sort((x, y) => y.levelScore - x.levelScore)[0] ?? null;
+  return plans.sort((x, y) => y.levelScore - x.levelScore);
 }
 
 // Entry at EMA20 4h, stop behind the 2-day swing, target at the 7-day extreme.
@@ -364,8 +374,7 @@ async function vkSummary(results, deposit) {
   // also those already in the trend lists above (a coin can be a trend short and a bounce long at once).
   const taken = new Set(all.map((x) => x.r.symbol));
   const bounce = ok
-    .map((r) => ({ r, t: bouncePlan(r) }))
-    .filter((x) => x.t)
+    .flatMap((r) => bouncePlans(r).map((t) => ({ r, t })))
     .map((x) => ({ ...x, mkt: regimeTag(regime, x.r.symbol, x.t.side) }))
     .sort((a, b) => b.t.levelScore - a.t.levelScore)
     .slice(0, MAX_BOUNCE);
@@ -481,7 +490,7 @@ async function vkSummary(results, deposit) {
   }
   // Telegram buttons: open a signal at the lower or upper risk (the bot asks to confirm first).
   const buttons = signals.map((s) => [
-    { text: `${s.watch ? "⏳" : s.bounce ? "↩️" : s.side === "long" ? "🟢" : "🔴"} ${s.symbol} ${RISK_MIN}%`, callback_data: `open:${s.id}:${RISK_MIN}` },
+    { text: `${s.watch ? "⏳" : s.bounce ? (s.side === "long" ? "↩️🟢" : "↩️🔴") : s.side === "long" ? "🟢" : "🔴"} ${s.symbol} ${RISK_MIN}%`, callback_data: `open:${s.id}:${RISK_MIN}` },
     { text: `${s.symbol} ${RISK_MAX}%`, callback_data: `open:${s.id}:${RISK_MAX}` },
   ]);
   const watchKey = watch.map((x) => `${x.r.symbol}:${x.t.side}`).sort().join(",");
@@ -652,8 +661,7 @@ async function coinReports() {
       }
     }
     // Bounce from a strong level, the scanner's second setup.
-    const b = bouncePlan(r);
-    if (b) {
+    for (const [j, b] of bouncePlans(r).entries()) {
       L.push(
         "",
         `↩️ Отскок от уровня ${n(b.level)} (${b.levelTags}): ${b.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} · R:R 1:${b.rr.toFixed(1)}` +
@@ -661,11 +669,11 @@ async function coinReports() {
         `▶️ Вход: ${n(b.entry)} (${b.retest ? "лимит на ретест" : "по рынку"}) · ⛔ Стоп: ${n(b.stop)} · 🎯 Тейк: ${n(b.target)} (${b.tpBy})`,
       );
       const s = {
-        id: `${Date.now().toString(36)}b`, ts: Date.now(), symbol: r.symbol, side: b.side, entry: b.entry, stop: b.stop,
+        id: `${Date.now().toString(36)}b${j}`, ts: Date.now(), symbol: r.symbol, side: b.side, entry: b.entry, stop: b.stop,
         target: b.target, rr: +b.rr.toFixed(2), stopPct: b.stopPct, strong: false, bounce: true, level: b.level, ...(b.retest ? { retest: true } : {}), repeat: false, manual: true,
       };
       if (!dry) appendSignals([s]);
-      buttons = [...(buttons ?? []), [RISK_MIN, RISK_MAX].map((k) => ({ text: `↩️ ${r.symbol} ${k}%`, callback_data: `open:${s.id}:${k}` }))];
+      buttons = [...(buttons ?? []), [RISK_MIN, RISK_MAX].map((k) => ({ text: `↩️${b.side === "long" ? "🟢" : "🔴"} ${r.symbol} ${k}%`, callback_data: `open:${s.id}:${k}` }))];
     }
     L.push("", "ℹ️ Расчёт по индикаторам, а не гарантия движения.");
     const text = L.join("\n");
