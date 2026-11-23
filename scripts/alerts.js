@@ -1,9 +1,13 @@
 // Real-time alerts for the watchlist, meant to run every 30 minutes from cron.
 // Looks at the last 30 minutes (two 15m candles) of every coin and reports:
 //   ⚡ sharp move      – the 30-min change is several times bigger than usual for this coin
-//   📈/📉 breakout     – price closed beyond the 2-day (or 30-day) high/low it was inside 30 min ago
-//   📊 volume spike    – 30-min turnover is several times the usual
-// Nothing is sent when nothing happened. The same alert for a coin is not repeated for REPEAT_H hours.
+//   📈/📉 breakout     – price went clearly beyond the 30-day high/low it was inside 30 min ago
+//   📊 volume spike    – 30-min turnover is several times the usual AND the price actually moved
+// Noise control:
+//   - a coin is quiet for REPEAT_H hours after any alert, unless the move has since grown ESCALATE_X times;
+//   - when many coins move the same way at once (whole market), one short market block is sent instead;
+//   - at most MAX_COINS coins per message.
+// Nothing is sent when nothing happened.
 //
 //   node --env-file=.env scripts/alerts.js            – check and send
 //   node --env-file=.env scripts/alerts.js --dry      – print only, nothing saved or sent
@@ -23,7 +27,13 @@ const MOVE_X = num("ALERT_MOVE_X", 3);             // move ≥ this × the coin'
 const MOVE_MIN = num("ALERT_MOVE_MIN_PCT", 2);     // …and at least this many %
 const VOL_X = num("ALERT_VOLUME_X", 4);            // turnover ≥ this × usual 30-min turnover…
 const VOL_MIN = num("ALERT_VOLUME_MIN_USD", 300e3); // …and at least this many $ (skips dead coins)
-const REPEAT_H = num("ALERT_REPEAT_HOURS", 2);     // do not repeat the same alert sooner than this
+const BREAK_MARGIN = num("ALERT_BREAK_MARGIN_PCT", 0.5); // breakout must clear the level by this many %
+const BREAK_MOVE = num("ALERT_BREAK_MOVE_PCT", 1);  // …with at least this 30-min move
+const VOL_MOVE = num("ALERT_VOLUME_MOVE_PCT", 1.5); // volume spike counts only with at least this move
+const REPEAT_H = num("ALERT_REPEAT_HOURS", 4);     // a coin stays quiet this long after an alert…
+const ESCALATE_X = num("ALERT_ESCALATE_X", 2);     // …unless its move grew this many times since
+const MARKET_N = num("ALERT_MARKET_COINS", 6);     // this many coins moving one way = market move
+const MAX_COINS = num("ALERT_MAX_COINS", 6);       // coins per message at most
 
 const args = process.argv.slice(2);
 const dry = args.includes("--dry");
@@ -44,6 +54,10 @@ const median = (a) => {
 };
 const fmt = (x) => String(+x.toPrecision(5));
 const pct = (x) => `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(1)}%`;
+const coinsRu = (n) => {
+  const d = n % 10, dd = n % 100;
+  return `${n} ${d === 1 && dd !== 11 ? "монета" : d >= 2 && d <= 4 && (dd < 12 || dd > 14) ? "монеты" : "монет"}`;
+};
 const money = (x) => (x >= 1e6 ? `${(x / 1e6).toFixed(1)} млн $` : `${(x / 1e3).toFixed(0)} тыс $`);
 
 async function check(symbol) {
@@ -68,16 +82,16 @@ async function check(symbol) {
     });
   }
 
-  // 📈/📉 Breakout: was inside the range 30 min ago, now beyond it. 30-day levels beat 2-day ones.
-  const hi2d = Math.max(...hist.map((x) => x.h)), lo2d = Math.min(...hist.map((x) => x.l));
+  // 📈/📉 Breakout of the 30-day range: was inside it 30 min ago, now clearly beyond, with a real move.
+  // (2-day highs/lows are broken many times a day and were pure noise.)
   const past30 = d1.slice(0, -1); // completed days
   const hi30 = Math.max(...past30.map((x) => x.h)), lo30 = Math.min(...past30.map((x) => x.l));
-  if (price > hi2d && before <= hi2d) {
-    const big = price > hi30 && before <= hi30;
-    found.push({ key: "breakup", text: `📈 пробой максимума ${big ? "30 дней" : "2 дней"} ${fmt(big ? hi30 : hi2d)}` });
-  } else if (price < lo2d && before >= lo2d) {
-    const big = price < lo30 && before >= lo30;
-    found.push({ key: "breakdn", text: `📉 пробой минимума ${big ? "30 дней" : "2 дней"} ${fmt(big ? lo30 : lo2d)}` });
+  if (Math.abs(move) >= BREAK_MOVE) {
+    if (before <= hi30 && price >= hi30 * (1 + BREAK_MARGIN / 100)) {
+      found.push({ key: "breakup", text: `📈 пробой максимума 30 дней ${fmt(hi30)}` });
+    } else if (before >= lo30 && price <= lo30 * (1 - BREAK_MARGIN / 100)) {
+      found.push({ key: "breakdn", text: `📉 пробой минимума 30 дней ${fmt(lo30)}` });
+    }
   }
 
   // 📊 Volume spike: the last 30 min against the median 30 min of the last 2 days (in $).
@@ -88,7 +102,7 @@ async function check(symbol) {
   // The forming candle is partial: scale it to a full 15 minutes so early runs are not underestimated.
   const elapsed = Math.min(1, Math.max(0.2, (Date.now() - last.t) / 900e3));
   const vol = usd(m15.at(-2)) + usd(last) / elapsed;
-  if (usualVol > 0 && vol >= VOL_X * usualVol && vol >= VOL_MIN) {
+  if (usualVol > 0 && vol >= VOL_X * usualVol && vol >= VOL_MIN && Math.abs(move) >= VOL_MOVE) {
     found.push({ key: "vol", text: `📊 всплеск объёма ×${(vol / usualVol).toFixed(1)} за 30 мин (${money(vol)})` });
   }
 
@@ -105,10 +119,19 @@ for (const s of symbols) {
   await sleep(150);
 }
 
-// Drop alerts already sent recently; remember the new ones.
+// Per coin: quiet for REPEAT_H hours after an alert, unless the move has grown ESCALATE_X times.
+// State: { "SOL": { t: <ms>, move: <%> } }. Old-format entries ("SOL:vol": ms) are dropped.
 const now = Date.now(), state = loadState();
-for (const k of Object.keys(state)) if (now - state[k] > 24 * 3600e3) delete state[k];
-const fresh = alerts.filter((a) => !(now - (state[`${a.symbol}:${a.key}`] ?? 0) < REPEAT_H * 3600e3));
+for (const k of Object.keys(state)) {
+  if (typeof state[k] !== "object" || !state[k] || now - state[k].t > 24 * 3600e3) delete state[k];
+}
+const byCoin = new Map();
+for (const a of alerts) byCoin.set(a.symbol, [...(byCoin.get(a.symbol) ?? []), a]);
+const fresh = [...byCoin.entries()].filter(([sym, list]) => {
+  const prev = state[sym];
+  if (!prev || now - prev.t >= REPEAT_H * 3600e3) return true;
+  return Math.abs(list[0].move) >= ESCALATE_X * Math.max(Math.abs(prev.move), MOVE_MIN);
+});
 
 if (isPaused()) {
   console.log(`${new Date().toISOString()} paused from Telegram, nothing sent.`);
@@ -119,22 +142,31 @@ if (!fresh.length) {
   process.exit(0);
 }
 
-// One block per coin, biggest movers first.
-const byCoin = new Map();
-for (const a of fresh) byCoin.set(a.symbol, [...(byCoin.get(a.symbol) ?? []), a]);
-const coins = [...byCoin.entries()].sort((a, b) => Math.abs(b[1][0].move) - Math.abs(a[1][0].move));
+// Biggest movers first.
+fresh.sort((a, b) => Math.abs(b[1][0].move) - Math.abs(a[1][0].move));
 const ts = new Date().toLocaleString("ru-RU", { timeZone: TZ, dateStyle: "short", timeStyle: "short" });
 const lines = [`🚨 Алерты BingX — ${ts} (${TZ_LABEL})`];
-for (const [sym, list] of coins) {
+
+// Whole market moving one way: one short block instead of a block per coin.
+const up = fresh.filter(([, l]) => l[0].move > 0), dn = fresh.filter(([, l]) => l[0].move < 0);
+const side = up.length >= MARKET_N ? up : dn.length >= MARKET_N ? dn : null;
+const shown = side ? fresh.filter((c) => !side.includes(c)) : fresh;
+if (side) {
+  const top = side.slice(0, 5).map(([sym, l]) => `${sym} ${pct(l[0].move)}`).join(", ");
+  const rest = side.length > 5 ? ` и ещё ${side.length - 5}` : "";
+  lines.push("", `🌊 весь рынок ${side === up ? "растёт" : "падает"}: ${coinsRu(side.length)} за 30 мин`, `     ${top}${rest}`);
+}
+for (const [sym, list] of shown.slice(0, MAX_COINS)) {
   lines.push("", `▪️ ${sym}: ${fmt(list[0].price)} (${pct(list[0].move)} за 30 мин)`);
   for (const a of list) lines.push(`     ${a.text}`);
 }
+if (shown.length > MAX_COINS) lines.push("", `…и ещё ${coinsRu(shown.length - MAX_COINS)}`);
 const text = lines.join("\n");
 
 if (dry) {
   console.log(text);
 } else if (await sendAll(text)) {
-  for (const a of fresh) state[`${a.symbol}:${a.key}`] = now;
+  for (const [sym, list] of fresh) state[sym] = { t: now, move: list[0].move };
   writeFileSync(STATE_FILE, JSON.stringify(state));
 } else {
   process.exitCode = 1;
