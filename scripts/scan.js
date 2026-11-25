@@ -546,6 +546,9 @@ if (coinMode) {
   console.log(`\nNo setups with R:R >= 1:${MIN_RR_WEAK}, nothing sent.`);
 } else if (dry) {
   console.log("\n--- message ---\n" + msg.text);
+  // What auto-trading would do now: real account, orders checked by BingX's test endpoint, nothing placed.
+  if (book) await autoTrade(msg.signals, { test: true });
+  else console.log("\n--- auto-trading ---\nNo access to the BingX account: auto-trading would not open anything.");
 } else if (send) {
   // --show (/scan from the bot): the signals as a message with buttons, nothing is opened. They are logged
   // as manual, like /coin: otherwise the next cron scan would take them for repeats and not open them.
@@ -570,7 +573,8 @@ if (coinMode) {
 // and take attached, like the "open" button in Telegram. As in the backtest: repeats (same coin and
 // direction within 24h) and coins already in work are skipped, one order per coin. Unfilled entries are
 // cancelled by the bot when the signal's entry time runs out. Telegram gets a short report.
-async function autoTrade(signals) {
+// test (--dry): the same checks, the order goes to BingX's test endpoint (validated, not placed), the report is printed.
+async function autoTrade(signals, { test = false } = {}) {
   const ts = new Date().toLocaleString("ru-RU", { timeZone: TZ, dateStyle: "short", timeStyle: "short" });
   const hm = (t) => new Date(t).toLocaleTimeString("ru-RU", { timeZone: TZ, hour: "2-digit", minute: "2-digit" });
   const n = (x) => String(+Number(x).toPrecision(5));
@@ -583,11 +587,11 @@ async function autoTrade(signals) {
     try {
       const p = await planOrder(s, RISK_MIN);
       const clientOrderId = `auto${s.id}`;
-      await placeOrder(p, { clientOrderId });
+      await placeOrder(p, { clientOrderId, test });
       const expires = s.ts + s.validH * 3600e3;
-      if (!p.immediate) addPendingOrder({ symbol: s.symbol, side: p.side, entry: p.entry, clientOrderId, expires });
+      if (!p.immediate && !test) addPendingOrder({ symbol: s.symbol, side: p.side, entry: p.entry, clientOrderId, expires });
       lines.push(
-        `✅ ${head} · ${s.bounce ? "отскок" : s.watch ? "ожидание" : "откат"} · R:R 1:${s.rr}`,
+        `${test ? "🧪" : "✅"} ${head} · ${s.bounce ? "отскок" : s.watch ? "ожидание" : "откат"} · R:R 1:${s.rr}`,
         `     ${p.immediate ? "вход по рынку" : `лимит ${n(p.entry)} до ${hm(expires)}`} · стоп ${n(p.stop)} (−${p.loss.toFixed(2)} $) · тейк ${n(p.target)} (+${p.gain.toFixed(2)} $)`,
         ...(p.minOrder ? [`     📏 минимальный ордер BingX: маржа ${p.margin.toFixed(2)} $, риск ${p.riskPctReal?.toFixed(1)}% депо вместо ${RISK_MIN}%`] : []),
       );
@@ -596,6 +600,7 @@ async function autoTrade(signals) {
     }
   }
   if (!lines.length) return console.log("\nAuto-trading: nothing new to open.");
+  if (test) return console.log(["", "--- auto-trading (test, nothing placed) ---", "🧪 — BingX принял бы ордер · ⚠️ — не открылся бы", "", ...lines].join("\n"));
   const text = [`🤖 Автоторговля — ${ts} (${TZ_LABEL}) · риск ${RISK_MIN}% на сделку`, "", ...lines, "", "/auto off — выключить · /pause — пауза"].join("\n");
   if (!(await sendSignal(text))) process.exitCode = 1;
 }
