@@ -589,6 +589,7 @@ async function autoTrade(signals) {
       lines.push(
         `✅ ${head} · ${s.bounce ? "отскок" : s.watch ? "ожидание" : "откат"} · R:R 1:${s.rr}`,
         `     ${p.immediate ? "вход по рынку" : `лимит ${n(p.entry)} до ${hm(expires)}`} · стоп ${n(p.stop)} (−${p.loss.toFixed(2)} $) · тейк ${n(p.target)} (+${p.gain.toFixed(2)} $)`,
+        ...(p.minOrder ? [`     📏 минимальный ордер BingX: маржа ${p.margin.toFixed(2)} $, риск ${p.riskPctReal?.toFixed(1)}% депо вместо ${RISK_MIN}%`] : []),
       );
     } catch (e) {
       lines.push(`⚠️ ${head}: не открыт — ${e.message}`);

@@ -228,6 +228,7 @@ async function onButton(data) {
         `⛔ Стоп: ${num(p.stop)} · −${usd(p.loss)}`,
         `🎯 Тейк: ${num(p.target)} · +${usd(p.gain)}`,
         `📦 Объём: ${num(p.qty)} ${p.asset} = ${usd(p.notional)} · маржа ${usd(p.margin)}`,
+        p.minOrder ? `📏 По риску ${risk}% объём меньше минимума BingX — открывается минимальный ордер: риск ${p.riskPctReal?.toFixed(1)}% депо` : null,
         p.immediate ? "⚠️ Цена уже прошла вход: ордер исполнится сразу по рынку." : `⏱ Если не исполнится до ${expires}, бот снимет ордер.`,
         busy.length ? `⚠️ По ${s.symbol} уже ${busy.join(" и ")}.` : null,
         "",

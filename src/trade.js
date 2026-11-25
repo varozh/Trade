@@ -33,6 +33,11 @@ export async function lastPrice(symbol) {
 }
 
 const floorTo = (x, digits) => Math.floor(x * 10 ** digits) / 10 ** digits;
+const ceilTo = (x, digits) => Number((Math.ceil(Number((x * 10 ** digits).toFixed(6))) / 10 ** digits).toFixed(digits));
+// Max margin of a minimum order opened when the risk-based size is below BingX's minimum ($, SCAN_MIN_ORDER_MAX_MARGIN).
+export const MIN_ORDER_MAX_MARGIN = Number(env("SCAN_MIN_ORDER_MAX_MARGIN")) > 0 ? Number(env("SCAN_MIN_ORDER_MAX_MARGIN")) : 2;
+// ...and only if its loss at the stop is at most this % of the deposit (SCAN_MIN_ORDER_MAX_RISK_PCT).
+export const MIN_ORDER_MAX_RISK_PCT = Number(env("SCAN_MIN_ORDER_MAX_RISK_PCT")) > 0 ? Number(env("SCAN_MIN_ORDER_MAX_RISK_PCT")) : 3;
 const roundTo = (x, digits) => Number(x.toFixed(digits));
 
 // Everything needed to show the order before it is sent. Throws with a readable reason if it cannot be placed.
@@ -48,15 +53,28 @@ export async function planOrder(signal, riskPct) {
   if (long ? price >= target : price <= target) throw new Error(`цена ${price} уже дошла до тейка ${target}, сигнал устарел`);
 
   const riskUsd = (acc.equity * riskPct) / 100;
-  const qty = floorTo(riskUsd / Math.abs(entry - stop), c.quantityPrecision);
-  const notional = qty * entry, margin = notional / LEVERAGE;
-  if (qty <= 0 || qty < Number(c.tradeMinQuantity) || notional < Number(c.tradeMinUSDT)) {
-    throw new Error(`объём ${qty} (${notional.toFixed(2)} $) меньше минимального ордера BingX: ${c.tradeMinQuantity} ${c.asset} / ${c.tradeMinUSDT} $`);
+  let qty = floorTo(riskUsd / Math.abs(entry - stop), c.quantityPrecision);
+  // Below BingX's minimum order: the minimum order instead, if its margin is at most MIN_ORDER_MAX_MARGIN.
+  // The loss at the stop is then bigger than riskPct of the deposit; `minOrder` marks it for the messages.
+  let minOrder = false;
+  const minQty = ceilTo(Math.max(Number(c.tradeMinQuantity) || 0, ((Number(c.tradeMinUSDT) || 0) / entry) * 1.001), c.quantityPrecision);
+  if (qty < minQty) {
+    const minMargin = (minQty * entry) / LEVERAGE;
+    const why = `по риску ${riskPct}% объём меньше минимального ордера BingX (${c.tradeMinQuantity} ${c.asset} / ${c.tradeMinUSDT} $)`;
+    if (minMargin > MIN_ORDER_MAX_MARGIN) throw new Error(`${why}, а его маржа ${minMargin.toFixed(2)} $ больше ${MIN_ORDER_MAX_MARGIN} $`);
+    const minLossPct = acc.equity > 0 ? ((minQty * Math.abs(entry - stop)) / acc.equity) * 100 : Infinity;
+    if (minLossPct > MIN_ORDER_MAX_RISK_PCT) {
+      throw new Error(`${why}, а его убыток по стопу ${(minQty * Math.abs(entry - stop)).toFixed(2)} $ = ${minLossPct.toFixed(1)}% депо, больше ${MIN_ORDER_MAX_RISK_PCT}%`);
+    }
+    qty = minQty;
+    minOrder = true;
   }
+  const notional = qty * entry, margin = notional / LEVERAGE;
   if (margin > acc.available) throw new Error(`нужна маржа ${margin.toFixed(2)} $, свободно ${acc.available.toFixed(2)} $`);
 
   return {
-    symbol, side: signal.side, riskPct, entry, stop, target, qty, notional, margin, price,
+    symbol, side: signal.side, riskPct, entry, stop, target, qty, notional, margin, price, minOrder,
+    riskPctReal: acc.equity > 0 ? ((qty * Math.abs(entry - stop)) / acc.equity) * 100 : null,
     loss: qty * Math.abs(entry - stop), gain: qty * Math.abs(target - entry),
     // Price already past the entry: the limit order fills at once at the market.
     immediate: long ? price <= entry : price >= entry,
