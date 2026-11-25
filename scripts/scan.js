@@ -5,17 +5,19 @@
 //   npm run scan                      – scan the default watchlist (WATCHLIST below)
 //   npm run scan -- BTC ETH SOL       – scan given symbols
 //   npm run scan -- --json            – raw JSON instead of a table
-//   npm run scan -- --send            – also send trade plans to Telegram (TG_BOT_TOKEN + TG_CHAT_ID in .env)
-//                                       and changes of open positions (needs BINGX_API_KEY); --vk is the same
+//   npm run scan -- --send            – open the new signals on BingX (auto-trading, needs BINGX_API_KEY with
+//                                       trading rights; SCAN_AUTO_TRADE=false or /auto off: send them to Telegram
+//                                       instead) and report changes of open positions; --vk is the same
+//   npm run scan -- --send --show     – send the signals to Telegram with buttons, open nothing (/scan in the bot)
 //   npm run scan -- --dry             – print that message without sending (--vk-dry is the same)
 import { BingXClient } from "../src/bingx.js";
 import { sendSignal } from "../src/notify.js";
 import { sendTg } from "../src/tg.js";
 import { toSymbols, pub, klines, sleep } from "../src/quotes.js";
-import { readJson, writeJson, readSignals, appendSignals, isPaused } from "../src/store.js";
+import { readJson, writeJson, readSignals, appendSignals, isPaused, autoTrading, addPendingOrder } from "../src/store.js";
 import { btcDominance, todayEvents, okxLiquidations, TZ, TZ_LABEL } from "../src/market.js";
-import { env } from "../src/env.js";
-import { openPositions, openOrders, isEntryOrder } from "../src/trade.js";
+import { env, riskLevels } from "../src/env.js";
+import { openPositions, openOrders, isEntryOrder, planOrder, placeOrder } from "../src/trade.js";
 
 // The watchlist lives in src/quotes.js (shared with the alerts).
 const args = process.argv.slice(2);
@@ -199,21 +201,22 @@ const READY_ATR = 0.75;      // max distance to EMA20 4h, in 4h ATRs
 const MAX_ATR_D = 10;        // skip coins with daily ATR above this %, too wild
 const MIN_VOL_RATIO = 0.5;   // skip coins whose volume dried up (7d vs 30d)
 const MAX_FUNDING = 0.03;    // skip if funding (%) is crowded against the trade
-const MAX_SETUPS = 5;        // keep the message short
 
 // Trade plan settings (override in .env).
 const envNum = (name, def) => {
   const v = env(name);
   return v != null && v !== "" && Number.isFinite(+v) ? +v : def;
 };
-const MIN_RR = envNum("SCAN_MIN_RR", 2);          // main list: reward/risk at least 1:MIN_RR
-const MIN_RR_WEAK = envNum("SCAN_MIN_RR_WEAK", 1); // separate list: from 1:MIN_RR_WEAK up to 1:MIN_RR
-const MAX_WEAK = 3;                                // keep the weaker list short
+// Pullback to EMA20 4h: R:R from 1:MIN_RR_WEAK up to (not including) 1:MIN_RR. A higher R:R means the price
+// already fell far from the 7-day extreme: in the backtest those were reversals, not pullbacks (the old
+// "strong" list, 10% takes), so they are not sent. The watch list still wants at least 1:MIN_RR.
+const MIN_RR = envNum("SCAN_MIN_RR", 2);
+const MIN_RR_WEAK = envNum("SCAN_MIN_RR_WEAK", 1);
+const MAX_TREND = 3;                               // keep the pullback list short
 const REPEAT_H = 24;                               // same coin+direction within this many hours = repeat
 const MAX_WATCH = 8;                               // watch list size
 const MAX_WATCH_ATR = 3;                           // watch list: entry at most this many 4h ATRs away
-const RISK_MIN = envNum("SCAN_RISK_MIN_PCT", 5);  // risk per trade, % of deposit (lower bound)
-const RISK_MAX = envNum("SCAN_RISK_MAX_PCT", 15); // risk per trade, % of deposit (upper bound)
+const [RISK_MIN, RISK_MAX] = riskLevels();       // risk per trade, % of deposit (see src/env.js)
 const LEVERAGE = envNum("SCAN_LEVERAGE", 30);     // leverage used to open trades: margin = position / leverage
 // Deposit: futures account equity read from BingX on every run (needs BINGX_API_KEY / BINGX_SECRET_KEY,
 // a read-only key is enough). Falls back to SCAN_DEPOSIT_USDT, then to sizes in % of deposit.
@@ -322,7 +325,7 @@ function tradePlan(r) {
   if (long ? r.rsi4h > 65 || r.fundingPct > MAX_FUNDING : r.rsi4h < 35 || r.fundingPct < -MAX_FUNDING) return null;
   if (!momentumOk(r, side)) return null;
   const lv = levels(r, side);
-  return lv.rr < MIN_RR_WEAK ? null : lv;
+  return lv.rr < MIN_RR_WEAK || lv.rr >= MIN_RR ? null : lv;
 }
 
 // Entry / stop / target for a side, without any filters.
@@ -384,9 +387,7 @@ async function vkSummary(results, deposit, held = new Set()) {
     .filter(free)
     .map((x) => ({ ...x, mkt: regimeTag(regime, x.r.symbol, x.t.side) }))
     .sort((a, b) => b.t.rr - a.t.rr);
-  // Against the market (see altRegime): never in the strong list, whatever the R:R.
-  const strong = all.filter((x) => x.t.rr >= MIN_RR && x.mkt !== "against").slice(0, MAX_SETUPS);
-  const weak = all.filter((x) => x.t.rr < MIN_RR || x.mkt === "against").slice(0, MAX_WEAK);
+  const trend = all.slice(0, MAX_TREND);
   // Bounces from strong levels (with the daily trend): a section of its own, every coin is checked,
   // also those already in the trend lists above.
   const taken = new Set(all.map((x) => x.r.symbol));
@@ -404,7 +405,7 @@ async function vkSummary(results, deposit, held = new Set()) {
     .filter((x) => free(x) && regimeTag(regime, x.r.symbol, x.t.side) !== "against")
     .sort((a, b) => a.t.dist - b.t.dist)
     .slice(0, MAX_WATCH);
-  if (!strong.length && !weak.length && !bounce.length) {
+  if (!trend.length && !bounce.length) {
     // Only the watch list: send it when it changed since the last message, not every 2 hours.
     const key = watch.map((x) => `${x.r.symbol}:${x.t.side}`).sort().join(",");
     if (!watch.length || key === readJson("watch-last.json", {}).key) return null;
@@ -426,8 +427,8 @@ async function vkSummary(results, deposit, held = new Set()) {
   // Repeat: the same coin and direction was already sent in the last 24h. Still shown, just marked.
   const now = Date.now();
   const recent = readSignals().filter((s) => !s.manual && now - s.ts < REPEAT_H * 3600e3);
-  const kind = (i) => (i < strong.length ? "strong" : i < strong.length + weak.length ? "weak" : i < strong.length + weak.length + bounce.length ? "bounce" : "watch");
-  const items = [...strong, ...weak, ...bounce, ...watch];
+  const kind = (i) => (i < trend.length ? "trend" : i < trend.length + bounce.length ? "bounce" : "watch");
+  const items = [...trend, ...bounce, ...watch];
   const signals = items.map(({ r, t }, i) => ({
     id: `${now.toString(36)}${i}`,
     ts: now,
@@ -439,7 +440,7 @@ async function vkSummary(results, deposit, held = new Set()) {
     rr: +t.rr.toFixed(2),
     stopPct: t.stopPct,
     validH: ENTRY_VALID_H,
-    strong: kind(i) === "strong",
+    strong: false, // the "strong" list is gone; old signals in the log still have it
     ...(kind(i) === "watch" ? { watch: true } : {}),
     ...(kind(i) === "bounce" ? { bounce: true, level: t.level } : {}),
     // Bounce and trend signals are different ideas: a repeat only within the same kind.
@@ -447,7 +448,7 @@ async function vkSummary(results, deposit, held = new Set()) {
   }));
   const sig = new Map(items.map((x, i) => [x, signals[i]])); // by list item: a coin may be in two lists
 
-  const liqSyms = [...new Set([...strong, ...weak, ...bounce].map(({ r }) => r.symbol))];
+  const liqSyms = [...new Set([...trend, ...bounce].map(({ r }) => r.symbol))];
   const liqList = await Promise.all(liqSyms.map((s) => safe(okxLiquidations(s))));
   const liqs = new Map(liqSyms.map((s, i) => [s, liqList[i]]));
   const section = (title, items) => {
@@ -494,8 +495,7 @@ async function vkSummary(results, deposit, held = new Set()) {
       lines.push(`📈 Открытый интерес: ${compactUsd(r.oiUsd)}${ch}`);
     }
   };
-  section(`✅ СИЛЬНЫЕ: R:R от 1:${MIN_RR}`, strong);
-  section(`🟡 СЛАБЕЕ: R:R 1:${MIN_RR_WEAK}–1:${MIN_RR}${weak.some((x) => x.mkt === "against") ? " или против рынка" : ""}`, weak);
+  section(`📉 ОТКАТ К EMA20 4Ч: R:R 1:${MIN_RR_WEAK}–1:${MIN_RR}`, trend);
   section("↩️ ОТСКОК ОТ СИЛЬНОГО УРОВНЯ", bounce);
   if (watch.length) {
     lines.push("", "━━━━━━━━━━━━", `⏳ ЖДЁМ ОТСКОКА К ВХОДУ — ${watch.length}`, `Лимит можно выставить заранее, срок ${ENTRY_VALID_H} ч:`, "");
@@ -547,11 +547,56 @@ if (coinMode) {
 } else if (dry) {
   console.log("\n--- message ---\n" + msg.text);
 } else if (send) {
+  // --show (/scan from the bot): the signals as a message with buttons, nothing is opened. They are logged
+  // as manual, like /coin: otherwise the next cron scan would take them for repeats and not open them.
+  // Otherwise, with auto-trading on, the signals are opened on BingX and only a report is sent.
+  const show = args.includes("--show");
   // Signals are logged even while paused: the weekly statistics should see them.
-  appendSignals(msg.signals);
-  writeJson("watch-last.json", { key: msg.watchKey });
+  appendSignals(show ? msg.signals.map((x) => ({ ...x, manual: true })) : msg.signals);
+  if (!show) writeJson("watch-last.json", { key: msg.watchKey });
+  const auto = !show && autoTrading(!/^false$/i.test(env("SCAN_AUTO_TRADE") ?? "true"));
   if (isPaused()) console.log("\nPaused from Telegram, nothing sent.");
-  else if (!(await sendSignal(msg.text, { tgButtons: msg.buttons }))) process.exitCode = 1;
+  else if (auto && book) await autoTrade(msg.signals);
+  else {
+    // Auto-trading without the account (no keys / BingX down) would not see open positions: signals instead.
+    const note = auto ? "⚠️ Автоторговля не сработала: нет доступа к счёту BingX. Сигналы — для ручного входа.\n\n" : "";
+    if (!(await sendSignal(note + msg.text, { tgButtons: msg.buttons }))) process.exitCode = 1;
+  }
+}
+
+// ---------- auto-trading ----------
+
+// Opens the new signals of this scan on BingX at the lower risk: a limit order at the entry with the stop
+// and take attached, like the "open" button in Telegram. As in the backtest: repeats (same coin and
+// direction within 24h) and coins already in work are skipped, one order per coin. Unfilled entries are
+// cancelled by the bot when the signal's entry time runs out. Telegram gets a short report.
+async function autoTrade(signals) {
+  const ts = new Date().toLocaleString("ru-RU", { timeZone: TZ, dateStyle: "short", timeStyle: "short" });
+  const hm = (t) => new Date(t).toLocaleTimeString("ru-RU", { timeZone: TZ, hour: "2-digit", minute: "2-digit" });
+  const n = (x) => String(+Number(x).toPrecision(5));
+  const lines = [];
+  const done = new Set();
+  for (const s of signals) {
+    if (s.repeat || done.has(s.symbol) || held.has(s.symbol)) continue;
+    done.add(s.symbol);
+    const head = `${s.side === "long" ? "🟢" : "🔴"} ${s.symbol} ${s.side === "long" ? "лонг" : "шорт"}`;
+    try {
+      const p = await planOrder(s, RISK_MIN);
+      const clientOrderId = `auto${s.id}`;
+      await placeOrder(p, { clientOrderId });
+      const expires = s.ts + s.validH * 3600e3;
+      if (!p.immediate) addPendingOrder({ symbol: s.symbol, side: p.side, entry: p.entry, clientOrderId, expires });
+      lines.push(
+        `✅ ${head} · ${s.bounce ? "отскок" : s.watch ? "ожидание" : "откат"} · R:R 1:${s.rr}`,
+        `     ${p.immediate ? "вход по рынку" : `лимит ${n(p.entry)} до ${hm(expires)}`} · стоп ${n(p.stop)} (−${p.loss.toFixed(2)} $) · тейк ${n(p.target)} (+${p.gain.toFixed(2)} $)`,
+      );
+    } catch (e) {
+      lines.push(`⚠️ ${head}: не открыт — ${e.message}`);
+    }
+  }
+  if (!lines.length) return console.log("\nAuto-trading: nothing new to open.");
+  const text = [`🤖 Автоторговля — ${ts} (${TZ_LABEL}) · риск ${RISK_MIN}% на сделку`, "", ...lines, "", "/auto off — выключить · /pause — пауза"].join("\n");
+  if (!(await sendSignal(text))) process.exitCode = 1;
 }
 
 // ---------- open positions ----------
@@ -749,12 +794,13 @@ async function coinReports() {
       if (!momentumOk(r, side)) notes.push(`нет импульса: RSI 4ч ${r.rsi4h.toFixed(0)}, нужно ${side === "long" ? `выше ${RSI_LONG_MIN}` : `ниже ${RSI_SHORT_MAX}`}`);
       if (!btcOk(btc, side)) notes.push("против тренда BTC на 4ч");
       if (p.rr < MIN_RR_WEAK) notes.push("R:R меньше 1:1");
+      if (p.rr >= MIN_RR) notes.push(`R:R от 1:${MIN_RR} — откат слишком глубокий, по бэктесту чаще разворот`);
       L.push(ready ? "✅ Готов по правилам сканера" : `⏳ Пока не готов: ${notes.join("; ") || "не прошёл фильтры сканера"}`);
       // Buttons only when the plan makes sense now: price before the entry and R:R at least 1:1.
-      if (p.dist >= 0 && p.rr >= MIN_RR_WEAK) {
+      if (p.dist >= 0 && p.rr >= MIN_RR_WEAK && p.rr < MIN_RR) {
         const s = {
           id: `${Date.now().toString(36)}c`, ts: Date.now(), symbol: r.symbol, side, entry: p.entry, stop: p.stop,
-          target: p.target, rr: +p.rr.toFixed(2), stopPct: p.stopPct, validH: ENTRY_VALID_H, strong: !!ready, repeat: false, manual: true,
+          target: p.target, rr: +p.rr.toFixed(2), stopPct: p.stopPct, validH: ENTRY_VALID_H, strong: false, repeat: false, manual: true,
         };
         if (!dry) appendSignals([s]);
         buttons = [[RISK_MIN, RISK_MAX].map((k) => ({ text: `${side === "long" ? "🟢" : "🔴"} ${r.symbol} ${k}%`, callback_data: `open:${s.id}:${k}` }))];

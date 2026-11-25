@@ -9,13 +9,13 @@
 import { readSignals } from "../src/store.js";
 import { pub, sleep } from "../src/quotes.js";
 import { sendInfo } from "../src/notify.js";
-import { env } from "../src/env.js";
+import { riskLevels } from "../src/env.js";
 import { TZ } from "../src/market.js";
 
 const args = process.argv.slice(2);
 const dry = args.includes("--dry");
 const days = Number(args[args.indexOf("--days") + 1]) || 7;
-const RISK = Number(env("SCAN_RISK_MIN_PCT")) || 5;
+const [RISK] = riskLevels();
 
 const D = 864e5, now = Date.now(), from = now - days * D;
 
@@ -84,8 +84,8 @@ if (!res.length) {
     if (g.length) lines.push(`${title}: ${g.length} закрыто · ${R(g.reduce((a, x) => a + x.r, 0))} · тейков ${Math.round((g.filter((x) => x.result === "take").length / g.length) * 100)}%`);
   };
   lines.push("", "━━━━━━━━━━━━");
-  group("✅ Сильные", (x) => x.strong);
-  group("🟡 Слабее", (x) => !x.strong && !x.watch && !x.bounce);
+  group("✅ Сильные (старый список)", (x) => x.strong);
+  group("📉 Откат к EMA20", (x) => !x.strong && !x.watch && !x.bounce);
   group("↩️ Отскок от уровня", (x) => x.bounce);
   group("⏳ Ожидание", (x) => x.watch);
   group("🟢 Лонги", (x) => x.side === "long");

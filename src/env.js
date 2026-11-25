@@ -33,3 +33,15 @@ export function splitText(text, max) {
   if (cur) parts.push(cur);
   return parts;
 }
+
+// Risk per trade, % of deposit: [lower, upper] (buttons, sizes in messages; auto-trading uses the lower).
+// SCAN_RISK_MIN_PCT / SCAN_RISK_MAX_PCT in .env, default 1 and 2, never above RISK_CAP_PCT:
+// the backtest had up to 20 stops in a row, at 5% risk that empties the account.
+export const RISK_CAP_PCT = 2;
+export function riskLevels() {
+  // A value above the cap (e.g. the old 5 / 15) is ignored: the default is used instead.
+  const num = (name, def) => { const v = Number(env(name)); return v > 0 && v <= RISK_CAP_PCT ? v : def; };
+  const lo = num("SCAN_RISK_MIN_PCT", 1);
+  const hi = Math.max(num("SCAN_RISK_MAX_PCT", 2), lo);
+  return [lo, hi];
+}

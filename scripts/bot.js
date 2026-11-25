@@ -2,15 +2,16 @@
 // Answers only the chat in TG_CHAT_ID; everyone else is ignored.
 //
 // Commands: /scan /coin SYM /signals /status /positions /journal [days] /stats [days] /top /list /add SYM /remove SYM
-//           /pause [hours] /resume /help
+//           /auto [on|off] /pause [hours] /resume /help
+// Auto-trading (scan.js from cron opens its signals on BingX) is switched with /auto; /pause stops it too.
 // Signal buttons "SYM 5%" / "SYM 15%" (under scanner messages and /signals) open a position after a confirmation.
 //
 //   node --env-file=.env scripts/bot.js
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { tgCall } from "../src/tg.js";
-import { env } from "../src/env.js";
-import { readSignals, pausedUntil, setPause, readJson, writeJson } from "../src/store.js";
+import { env, riskLevels } from "../src/env.js";
+import { readSignals, pausedUntil, setPause, readPendingOrders, writePendingOrders, addPendingOrder, autoTrading, setAutoTrading } from "../src/store.js";
 import { TZ } from "../src/market.js";
 import { planOrder, placeOrder, account, openPositions, openOrders, isEntryOrder, orderStatus, cancelOrder, LEVERAGE } from "../src/trade.js";
 import { watchlist, editWatchlist, pub } from "../src/quotes.js";
@@ -23,10 +24,10 @@ if (!env("TG_BOT_TOKEN") || !CHAT) {
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SIGNAL_MAX_AGE_H = 6; // older signals cannot be opened from a button (signals without their own validH)
 // How long the entry of a signal is valid: saved with the signal by the scanner (4h), older ones 6h.
+const autoOn = () => autoTrading(!/^false$/i.test(env("SCAN_AUTO_TRADE") ?? "true"));
 const validMs = (s) => (s.validH ?? SIGNAL_MAX_AGE_H) * 3600e3;
-const ORDERS_FILE = "pending-orders.json"; // entry orders placed from signals, cancelled when the entry expires
 const EXPIRY_CHECK_MS = 5 * 60e3;
-const RISKS = [Number(env("SCAN_RISK_MIN_PCT")) || 5, Number(env("SCAN_RISK_MAX_PCT")) || 15];
+const RISKS = riskLevels();
 
 const say = (text, buttons) =>
   tgCall("sendMessage", { chat_id: CHAT, text, disable_web_page_preview: true, ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}) });
@@ -59,7 +60,7 @@ const commands = {
     await say(
       [
         "🤖 Команды:",
-        "/scan — скан прямо сейчас",
+        "/scan — скан прямо сейчас (сигналы с кнопками, без автооткрытия)",
         "/coin SOL — анализ и прогноз по монете",
         "/signals — сигналы последнего скана с кнопками открытия",
         "/status — депозит, позиции, пауза",
@@ -70,7 +71,8 @@ const commands = {
         "/list — список монет для анализа",
         "/add NEAR — добавить монету (можно несколько)",
         "/remove NEAR — убрать монету",
-        "/pause 12 — пауза сигналов и алертов на N часов",
+        "/auto on | off — автоторговля: сканер сам открывает сигналы на BingX",
+        "/pause 12 — пауза автоторговли, сигналов и алертов на N часов",
         "/resume — снять паузу",
       ].join("\n"),
     );
@@ -79,7 +81,7 @@ const commands = {
     return commands.help();
   },
   async scan() {
-    await runAndReport("scan.js", ["--send"], "⏳ Сканирую, около минуты…", /nothing sent/, "Подходящих сетапов сейчас нет.");
+    await runAndReport("scan.js", ["--send", "--show"], "⏳ Сканирую, около минуты…", /nothing sent/, "Подходящих сетапов сейчас нет.");
   },
   async signals() {
     const all = readSignals().filter((s) => !s.manual); // /coin analyses are not scanner signals
@@ -101,6 +103,7 @@ const commands = {
       [
         `💼 Депозит: ${usd(acc.equity)} · свободно ${usd(acc.available)}`,
         `📂 Открытых позиций: ${pos.length}${pos.length ? ` · PnL ${usd(pos.reduce((a, p) => a + p.pnl, 0))}` : ""}`,
+        `🤖 Автоторговля: ${autoOn() ? `включена, риск ${RISKS[0]}% на сделку` : "выключена"}`,
         `⏸ ${until > Date.now() ? `Пауза до ${time(until)}` : "Пауза выключена"}`,
         `📨 Последний сигнал: ${last ? `${time(last.ts)} (${last.symbol})` : "нет"}`,
       ].join("\n"),
@@ -143,10 +146,21 @@ const commands = {
   async remove(arg) {
     await editCoins(arg, false);
   },
+  async auto(arg) {
+    const a = arg.toLowerCase();
+    if (/^(on|вкл)/.test(a)) setAutoTrading(true);
+    else if (/^(off|выкл)/.test(a)) setAutoTrading(false);
+    else if (a) return say("/auto on — включить, /auto off — выключить, /auto — состояние");
+    await say(
+      autoOn()
+        ? `🤖 Автоторговля включена: каждый новый сигнал сканера открывается на BingX с риском ${RISKS[0]}%, неисполненный лимит снимается через 4 ч. /auto off — выключить.`
+        : "✋ Автоторговля выключена: сигналы приходят сюда с кнопками, открываете вы. /auto on — включить.",
+    );
+  },
   async pause(arg) {
     const h = Number(arg) || 12;
     setPause(Date.now() + h * 3600e3);
-    await say(`⏸ Сигналы и алерты на паузе до ${time(Date.now() + h * 3600e3)}. Отчёты и дневник приходят как обычно. /resume — снять.`);
+    await say(`⏸ Автоторговля, сигналы и алерты на паузе до ${time(Date.now() + h * 3600e3)}. Отчёты и дневник приходят как обычно. /resume — снять.`);
   },
   async resume() {
     setPause(0);
@@ -231,9 +245,7 @@ async function onButton(data) {
       const r = await placeOrder(p, { clientOrderId });
       const orderId = r?.order?.orderId ?? r?.orderId ?? "";
       if (!p.immediate) {
-        const list = readJson(ORDERS_FILE, []);
-        list.push({ symbol: s.symbol, side: p.side, entry: p.entry, clientOrderId, expires: s.ts + validMs(s) });
-        writeJson(ORDERS_FILE, list);
+        addPendingOrder({ symbol: s.symbol, side: p.side, entry: p.entry, clientOrderId, expires: s.ts + validMs(s) });
       }
       return say(`✅ Ордер выставлен: ${s.symbol} ${p.side === "long" ? "лонг" : "шорт"} ${num(p.qty)} по ${num(p.entry)}, стоп ${num(p.stop)}, тейк ${num(p.target)}${orderId ? `\nID: ${orderId}` : ""}`);
     } catch (e) {
@@ -249,7 +261,7 @@ let lastExpiryCheck = 0;
 async function cancelExpired() {
   if (Date.now() - lastExpiryCheck < EXPIRY_CHECK_MS) return;
   lastExpiryCheck = Date.now();
-  const list = readJson(ORDERS_FILE, []);
+  const list = readPendingOrders();
   if (!list.length) return;
   const keep = [];
   for (const o of list) {
@@ -267,7 +279,9 @@ async function cancelExpired() {
       if (Date.now() - o.expires < 24 * 3600e3) keep.push(o); // try again later, give up after a day
     }
   }
-  writeJson(ORDERS_FILE, keep);
+  // The scanner may have added orders while this ran: keep those too.
+  const added = readPendingOrders().filter((o) => !list.some((x) => x.clientOrderId === o.clientOrderId));
+  writePendingOrders([...keep, ...added]);
 }
 
 // ---------- main loop ----------
@@ -286,6 +300,7 @@ await tgCall("setMyCommands", {
     ["list", "список монет для анализа"],
     ["add", "добавить монету, /add NEAR"],
     ["remove", "убрать монету, /remove NEAR"],
+    ["auto", "автоторговля, /auto on | off"],
     ["pause", "пауза сигналов, /pause 12"],
     ["resume", "снять паузу"],
     ["help", "список команд"],

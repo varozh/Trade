@@ -38,3 +38,18 @@ export function writeSignals(list) {
 export const pausedUntil = () => readJson("pause.json", {}).until ?? 0;
 export const isPaused = () => Date.now() < pausedUntil();
 export const setPause = (until) => writeJson("pause.json", { until });
+
+// ---------- auto-trading (scanner opens its signals on BingX itself) ----------
+// On unless SCAN_AUTO_TRADE=false in .env; /auto on|off in Telegram overrides that.
+export function autoTrading(envDefault) {
+  const v = readJson("auto.json", {}).on;
+  return typeof v === "boolean" ? v : envDefault;
+}
+export const setAutoTrading = (on) => writeJson("auto.json", { on });
+
+// ---------- entry orders waiting to be filled ----------
+// Limit entries placed by the bot or the auto-trader; the bot cancels them when the signal's entry expires.
+const PENDING = "pending-orders.json";
+export const readPendingOrders = () => readJson(PENDING, []);
+export const writePendingOrders = (list) => writeJson(PENDING, list);
+export const addPendingOrder = (o) => writePendingOrders([...readPendingOrders(), o]);
