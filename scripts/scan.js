@@ -5,16 +5,17 @@
 //   npm run scan                      – scan the default watchlist (WATCHLIST below)
 //   npm run scan -- BTC ETH SOL       – scan given symbols
 //   npm run scan -- --json            – raw JSON instead of a table
-//   npm run scan -- --send            – also send trade plans to VK and Telegram (whichever is set in .env:
-//                                       VK_TOKEN + VK_USER_ID, TG_BOT_TOKEN + TG_CHAT_ID); --vk is the same
+//   npm run scan -- --send            – also send trade plans to Telegram (TG_BOT_TOKEN + TG_CHAT_ID in .env)
+//                                       and changes of open positions (needs BINGX_API_KEY); --vk is the same
 //   npm run scan -- --dry             – print that message without sending (--vk-dry is the same)
 import { BingXClient } from "../src/bingx.js";
-import { sendAll } from "../src/notify.js";
+import { sendSignal } from "../src/notify.js";
 import { sendTg } from "../src/tg.js";
 import { toSymbols, pub, klines, sleep } from "../src/quotes.js";
 import { readJson, writeJson, readSignals, appendSignals, isPaused } from "../src/store.js";
 import { btcDominance, todayEvents, okxLiquidations, TZ, TZ_LABEL } from "../src/market.js";
 import { env } from "../src/env.js";
+import { openPositions, openOrders, isEntryOrder } from "../src/trade.js";
 
 // The watchlist lives in src/quotes.js (shared with the alerts).
 const args = process.argv.slice(2);
@@ -249,8 +250,18 @@ const BOUNCE_TOUCH_ATR = 0.5; // the day's extreme came at least this close to t
 const BOUNCE_PIERCE_ATR = 1;  // a wick through the level up to this deep still counts as a test
 const BOUNCE_MIN_MOVE = 0.5;  // the price already moved this far off the extreme: the bounce has started
 const BOUNCE_MAX_DIST = 1.5;  // ...but is no further than this from the level, or the market entry is late
-const BOUNCE_RETEST_ATR = 0.25; // retest limit order this far above (long) / below (short) the level
 const MAX_BOUNCE = 6;
+
+// Filters from the backtest of Sep–Nov 2026 (every setup kind):
+//   momentum: RSI 4h above 55 for a long, below 45 for a short — the move is already going the trade's way;
+//   BTC: no alt long while BTC 4h trend is down, no short while it is up;
+//   bounces only with the daily trend and only at the market (limit orders on a retest lost money);
+//   an entry is valid ENTRY_VALID_H hours: a limit filled later mostly fills on a reversal.
+const RSI_LONG_MIN = envNum("SCAN_RSI_LONG_MIN", 55);
+const RSI_SHORT_MAX = envNum("SCAN_RSI_SHORT_MAX", 45);
+const ENTRY_VALID_H = 4;
+const momentumOk = (r, side) => (side === "long" ? r.rsi4h > RSI_LONG_MIN : r.rsi4h < RSI_SHORT_MAX);
+const btcOk = (btc, side) => !btc || (side === "long" ? btc.trend4h !== "DN" : btc.trend4h !== "UP");
 
 // Both sides can qualify at once (a range: long from support, short from resistance), so all are returned.
 function bouncePlans(r) {
@@ -260,6 +271,8 @@ function bouncePlans(r) {
   for (const side of ["long", "short"]) {
     const dir = side === "long" ? 1 : -1;
     if (side === "long" ? r.fundingPct > MAX_FUNDING : r.fundingPct < -MAX_FUNDING) continue;
+    if (r.trend1d === (side === "long" ? "DN" : "UP")) continue; // against the daily trend
+    if (!momentumOk(r, side)) continue;
     const ext = side === "long" ? r.lo1d4h : r.hi1d4h;
     // Nearest strong level under the price (long) / above it (short) that the day's extreme tested.
     const lvl = r.levels
@@ -271,7 +284,7 @@ function bouncePlans(r) {
     if ((p - ext) * dir < BOUNCE_MIN_MOVE * a) continue; // no bounce yet
     // Behind both the level and the wick of the test.
     const stop0 = (side === "long" ? Math.min(ext, lvl.v) : Math.max(ext, lvl.v)) - dir * STOP_BUFFER_ATR * a;
-    const plan = (entry, retest) => {
+    const plan = (entry) => {
       let stop = stop0;
       if (Math.abs(entry - stop) < MIN_STOP_ATR * a) stop = entry - dir * MIN_STOP_ATR * a;
       const risk = Math.abs(entry - stop);
@@ -282,17 +295,15 @@ function bouncePlans(r) {
       const [target, tpBy] = ahead ?? [entry + dir * ATR_TARGET * a, "ATR"];
       const rr = Math.abs(target - entry) / risk;
       return {
-        side, entry, stop, target, tpBy, rr, retest, dist: (p - entry) * dir / a, stopPct: (risk / entry) * 100,
+        side, entry, stop, target, tpBy, rr, dist: (p - entry) * dir / a, stopPct: (risk / entry) * 100,
         level: lvl.v, levelTags: lvl.tags, levelScore: lvl.score,
-        counter: r.trend1d === (side === "long" ? "DN" : "UP"), // against the daily trend
       };
     };
-    // Entry at the market while the price is still near the level; otherwise (or when the first obstacle
-    // is too close for that) a limit order on a retest of the level, just above it (long) / below it (short).
-    const now = (p - lvl.v) * dir <= BOUNCE_MAX_DIST * a ? plan(p, false) : null;
-    const best = now?.rr >= BOUNCE_MIN_RR ? now : plan(lvl.v + dir * BOUNCE_RETEST_ATR * a, true);
-    if (best.rr < BOUNCE_MIN_RR || best.dist > MAX_WATCH_ATR) continue;
-    plans.push(best);
+    // Entry at the market, only while the price is still near the level.
+    if ((p - lvl.v) * dir > BOUNCE_MAX_DIST * a) continue;
+    const now = plan(p);
+    if (now.rr < BOUNCE_MIN_RR) continue;
+    plans.push(now);
   }
   return plans.sort((x, y) => y.levelScore - x.levelScore);
 }
@@ -309,6 +320,7 @@ function tradePlan(r) {
   const dist = (long ? r.price - entry : entry - r.price) / a;
   if (dist < 0 || dist > READY_ATR) return null;
   if (long ? r.rsi4h > 65 || r.fundingPct > MAX_FUNDING : r.rsi4h < 35 || r.fundingPct < -MAX_FUNDING) return null;
+  if (!momentumOk(r, side)) return null;
   const lv = levels(r, side);
   return lv.rr < MIN_RR_WEAK ? null : lv;
 }
@@ -347,10 +359,14 @@ function regimeTag(regime, symbol, side) {
 
 // Extra context must never break the report: on any error the line is just left out.
 const safe = (p) => p.catch((e) => (console.error(`context: ${e.message}`), null));
+// BTC for the 4h trend filter: from this scan, or analysed on its own when it is not in the list.
+let btcPromise;
+const btcResult = () => (btcPromise ??= Promise.resolve(results.find((r) => r.symbol === "BTC" && !r.error) ?? safe(analyze("BTC-USDT"))));
 const compactUsd = (x) =>
   x >= 1e6 ? `${(x / 1e6).toFixed(1)} млн $` : x >= 1e3 ? `${(x / 1e3).toFixed(0)} тыс $` : `${x.toFixed(0)} $`;
 
-async function vkSummary(results, deposit) {
+// held: coins with an open position or a pending entry order — no new signals for them.
+async function vkSummary(results, deposit, held = new Set()) {
   const DEPOSIT = deposit?.amount ?? 0;
   const ok = results.filter((r) => !r.error);
   const num = (x) => String(+x.toPrecision(5));
@@ -359,22 +375,24 @@ async function vkSummary(results, deposit) {
   const ts = new Date().toLocaleString("ru-RU", { timeZone: TZ, dateStyle: "short", timeStyle: "short" });
   // Fetched on every run, even with no setups: dominance history for the 24h change builds up from these.
   const [btcd, events] = await Promise.all([safe(btcDominance()), safe(todayEvents({ upcomingOnly: true }))]);
-  const btc = ok.find((r) => r.symbol === "BTC");
+  const btc = await btcResult();
   const regime = altRegime(btcd?.change24h, btc?.ch1d);
+  const free = (x) => x.t && btcOk(btc, x.t.side) && !held.has(x.r.symbol);
 
   const all = ok
     .map((r) => ({ r, t: tradePlan(r) }))
-    .filter((x) => x.t)
+    .filter(free)
     .map((x) => ({ ...x, mkt: regimeTag(regime, x.r.symbol, x.t.side) }))
     .sort((a, b) => b.t.rr - a.t.rr);
   // Against the market (see altRegime): never in the strong list, whatever the R:R.
   const strong = all.filter((x) => x.t.rr >= MIN_RR && x.mkt !== "against").slice(0, MAX_SETUPS);
   const weak = all.filter((x) => x.t.rr < MIN_RR || x.mkt === "against").slice(0, MAX_WEAK);
-  // Bounces from strong levels (may go against the trend): a section of its own, every coin is checked,
-  // also those already in the trend lists above (a coin can be a trend short and a bounce long at once).
+  // Bounces from strong levels (with the daily trend): a section of its own, every coin is checked,
+  // also those already in the trend lists above.
   const taken = new Set(all.map((x) => x.r.symbol));
   const bounce = ok
     .flatMap((r) => bouncePlans(r).map((t) => ({ r, t })))
+    .filter(free)
     .map((x) => ({ ...x, mkt: regimeTag(regime, x.r.symbol, x.t.side) }))
     .sort((a, b) => b.t.levelScore - a.t.levelScore)
     .slice(0, MAX_BOUNCE);
@@ -383,7 +401,7 @@ async function vkSummary(results, deposit) {
   const watch = ok
     .filter((r) => !taken.has(r.symbol))
     .map((r) => ({ r, t: watchPlan(r) }))
-    .filter((x) => x.t && regimeTag(regime, x.r.symbol, x.t.side) !== "against")
+    .filter((x) => free(x) && regimeTag(regime, x.r.symbol, x.t.side) !== "against")
     .sort((a, b) => a.t.dist - b.t.dist)
     .slice(0, MAX_WATCH);
   if (!strong.length && !weak.length && !bounce.length) {
@@ -401,6 +419,9 @@ async function vkSummary(results, deposit) {
   if (regime === "alts-weak") lines.push("📉 Доминация растёт, BTC падает → альты слабее: лонги по альтам понижены");
   if (regime === "alts-strong") lines.push("📈 Доминация падает, BTC растёт → альты сильнее: шорты по альтам понижены");
   if (events?.length) lines.push(`📅 Сегодня: ${events.map((e) => `${e.time} ${e.title}`).join("; ")}`);
+  if (held.size) lines.push(`📂 Уже в работе: ${[...held].join(", ")} — сигналы по ним не шлются`);
+  const until = new Date(Date.now() + ENTRY_VALID_H * 3600e3).toLocaleTimeString("ru-RU", { timeZone: TZ, hour: "2-digit", minute: "2-digit" });
+  lines.push(`⏱ Вход действует ${ENTRY_VALID_H} ч, до ${until}: не исполнился — сигнал отменяется`);
 
   // Repeat: the same coin and direction was already sent in the last 24h. Still shown, just marked.
   const now = Date.now();
@@ -417,9 +438,10 @@ async function vkSummary(results, deposit) {
     target: t.target,
     rr: +t.rr.toFixed(2),
     stopPct: t.stopPct,
+    validH: ENTRY_VALID_H,
     strong: kind(i) === "strong",
     ...(kind(i) === "watch" ? { watch: true } : {}),
-    ...(kind(i) === "bounce" ? { bounce: true, level: t.level, ...(t.retest ? { retest: true } : {}) } : {}),
+    ...(kind(i) === "bounce" ? { bounce: true, level: t.level } : {}),
     // Bounce and trend signals are different ideas: a repeat only within the same kind.
     repeat: recent.some((s) => s.symbol === r.symbol && s.side === t.side && !!s.bounce === (kind(i) === "bounce")),
   }));
@@ -453,10 +475,9 @@ async function vkSummary(results, deposit) {
       "━━━━━━━━━━━━",
       `${t.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} ${r.symbol} · R:R 1:${t.rr.toFixed(1)}` +
         (mkt === "with" ? " · по рынку" : mkt === "against" ? " · против рынка" : "") +
-        (t.counter ? " · ⚠️ против тренда" : "") +
         (sig.get(item)?.repeat ? " · 🔁 повтор" : ""),
       ...(t.level ? [`📍 Уровень ${num(t.level)} (${t.levelTags}) · тейк: ${t.tpBy}`] : []),
-      `▶️ Вход: ${num(t.entry)}${t.level ? (t.retest ? " (лимит на ретест уровня)" : " (по рынку)") : ""}`,
+      `▶️ Вход: ${num(t.entry)}${t.level ? " (по рынку)" : ""}`,
       `⛔ Стоп: ${num(t.stop)}`,
       `🎯 Тейк: ${num(t.target)}`,
       ...size(RISK_MIN),
@@ -477,7 +498,7 @@ async function vkSummary(results, deposit) {
   section(`🟡 СЛАБЕЕ: R:R 1:${MIN_RR_WEAK}–1:${MIN_RR}${weak.some((x) => x.mkt === "against") ? " или против рынка" : ""}`, weak);
   section("↩️ ОТСКОК ОТ СИЛЬНОГО УРОВНЯ", bounce);
   if (watch.length) {
-    lines.push("", "━━━━━━━━━━━━", `⏳ ЖДЁМ ОТСКОКА К ВХОДУ — ${watch.length}`, "Лимитный ордер можно выставить заранее:", "");
+    lines.push("", "━━━━━━━━━━━━", `⏳ ЖДЁМ ОТСКОКА К ВХОДУ — ${watch.length}`, `Лимит можно выставить заранее, срок ${ENTRY_VALID_H} ч:`, "");
     for (const item of watch) {
       const { r, t } = item;
       const to = (t.entry / r.price - 1) * 100;
@@ -498,11 +519,12 @@ async function vkSummary(results, deposit) {
 }
 
 // Watch list rule: the same trend setup as tradePlan, but the price is still MORE than READY_ATR
-// from the entry (up to MAX_WATCH_ATR), and oversold/overbought is fine — that is exactly why it waits.
+// from the entry (up to MAX_WATCH_ATR); the RSI 4h momentum filter applies here too.
 function watchPlan(r) {
   const side = r.trend4h === "UP" && r.trend1d === "UP" ? "long" : r.trend4h === "DN" && r.trend1d === "DN" ? "short" : null;
   if (!side || r.atr1dPct > MAX_ATR_D || r.volRatio7to30 < MIN_VOL_RATIO) return null;
   if (side === "long" ? r.fundingPct > MAX_FUNDING : r.fundingPct < -MAX_FUNDING) return null;
+  if (!momentumOk(r, side)) return null;
   const lv = levels(r, side);
   if (lv.dist <= READY_ATR || lv.dist > MAX_WATCH_ATR || lv.rr < MIN_RR) return null;
   return lv;
@@ -513,7 +535,11 @@ function watchPlan(r) {
 const dry = args.includes("--dry") || args.includes("--vk-dry");
 const send = args.includes("--send") || args.includes("--vk");
 const coinMode = args.includes("--coin");
-const msg = !coinMode && (dry || send) ? await vkSummary(results, await fetchDeposit()) : null;
+// Open positions and pending entry orders: no new signals for those coins, changes go as a message of their own.
+const book = !coinMode && (dry || send) ? await fetchBook() : null;
+const held = new Set(book ? [...book.positions.map((p) => p.symbol), ...book.orders.filter(isEntryOrder).map((o) => o.symbol)] : []);
+const msg = !coinMode && (dry || send) ? await vkSummary(results, await fetchDeposit(), held) : null;
+if (book) await positionUpdates(book);
 if (coinMode) {
   await coinReports();
 } else if ((dry || send) && !msg) {
@@ -525,7 +551,82 @@ if (coinMode) {
   appendSignals(msg.signals);
   writeJson("watch-last.json", { key: msg.watchKey });
   if (isPaused()) console.log("\nPaused from Telegram, nothing sent.");
-  else if (!(await sendAll(msg.text, { tgButtons: msg.buttons }))) process.exitCode = 1;
+  else if (!(await sendSignal(msg.text, { tgButtons: msg.buttons }))) process.exitCode = 1;
+}
+
+// ---------- open positions ----------
+
+// Positions and open orders from BingX; null without API keys or on an error (signals still go out).
+async function fetchBook() {
+  if (!env("BINGX_API_KEY") || !env("BINGX_SECRET_KEY")) return null;
+  try {
+    const [positions, orders] = await Promise.all([openPositions(), openOrders()]);
+    return { positions, orders };
+  } catch (e) {
+    console.error(`BingX positions failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Compares every open position with the previous scan (data/positions.json) and sends what changed:
+// opened / closed, size, stop and take moved, the 4h or daily trend turning against the position (or back),
+// the scanner seeing a setup the other way. Sent even while paused: it is about money already in the market.
+// The first run only saves the state, so a deploy does not report every existing position as new.
+async function positionUpdates({ positions, orders }) {
+  const STATE = "positions.json";
+  const prev = readJson(STATE, null);
+  const num = (x) => String(+Number(x).toPrecision(5));
+  const usd = (x) => `${x >= 0 ? "+" : "−"}${Math.abs(x).toLocaleString("ru-RU", { maximumFractionDigits: 2 })} $`;
+  const sideRu = (s) => (s === "long" ? "лонг" : "шорт");
+  const byResult = new Map(results.filter((r) => !r.error).map((r) => [r.symbol, r]));
+  const now = {};
+  for (const p of positions) {
+    const dir = p.side === "long" ? 1 : -1;
+    // Stop and take: closing stop / take-profit orders of this coin and side.
+    const closing = orders.filter((o) => o.symbol === p.symbol && (o.positionSide === (p.side === "long" ? "LONG" : "SHORT") || o.positionSide === "BOTH") && o.side === (p.side === "long" ? "SELL" : "BUY"));
+    const stop = closing.find((o) => /^STOP/.test(o.type))?.stopPrice || null;
+    const take = closing.find((o) => /^TAKE_PROFIT/.test(o.type))?.stopPrice || null;
+    const r = byResult.get(p.symbol) ?? (await safe(analyze(`${p.symbol}-USDT`)));
+    const against = (t) => (t ? t === (dir > 0 ? "DN" : "UP") : null);
+    const opp = p.side === "long" ? "short" : "long";
+    const oppSetup = r
+      ? (tradePlan(r)?.side === opp && "откат к EMA20") || (bouncePlans(r).some((b) => b.side === opp) && "отскок от уровня") || (watchPlan(r)?.side === opp && "в списке ожидания") || null
+      : null;
+    now[`${p.symbol}:${p.side}`] = {
+      symbol: p.symbol, side: p.side, qty: p.qty, entry: p.entry, pnl: p.pnl, stop, take,
+      against4h: against(r?.trend4h), against1d: against(r?.trend1d), oppSetup, price: r?.price,
+    };
+  }
+
+  const out = [];
+  if (prev) {
+    for (const [key, x] of Object.entries(now)) {
+      const o = prev[key];
+      const head = `${x.side === "long" ? "🟢" : "🔴"} ${x.symbol} ${sideRu(x.side)}`;
+      if (!o) {
+        out.push(`📂 ${head}: открыта позиция ${num(x.qty)} по ${num(x.entry)}` + `${x.stop ? ` · стоп ${num(x.stop)}` : " · ⚠️ без стопа"}${x.take ? ` · тейк ${num(x.take)}` : ""}`);
+        continue;
+      }
+      const ch = [];
+      if (Math.abs(x.qty - o.qty) > 1e-9 * Math.max(x.qty, o.qty)) ch.push(x.qty > o.qty ? `➕ объём увеличен: ${num(o.qty)} → ${num(x.qty)}, средняя ${num(x.entry)}` : `➖ частично закрыта: ${num(o.qty)} → ${num(x.qty)}`);
+      if (x.stop !== o.stop) ch.push(x.stop ? `⛔ стоп ${o.stop ? `перенесён: ${num(o.stop)} → ` : "выставлен: "}${num(x.stop)}` : "⚠️ стоп снят — позиция без стопа");
+      if (x.take !== o.take) ch.push(x.take ? `🎯 тейк ${o.take ? `перенесён: ${num(o.take)} → ` : "выставлен: "}${num(x.take)}` : "🎯 тейк снят");
+      if (x.against4h != null && o.against4h != null && x.against4h !== o.against4h) ch.push(x.against4h ? "⚠️ тренд 4ч развернулся против позиции" : "✅ тренд 4ч больше не против позиции");
+      if (x.against1d != null && o.against1d != null && x.against1d !== o.against1d) ch.push(x.against1d ? "⚠️ дневной тренд развернулся против позиции" : "✅ дневной тренд больше не против позиции");
+      if (x.oppSetup && !o.oppSetup) ch.push(`🔄 сканер видит сетап в обратную сторону (${sideRu(x.side === "long" ? "short" : "long")}, ${x.oppSetup})`);
+      if (ch.length) out.push(`${head} · вход ${num(x.entry)}${x.price ? ` · цена ${num(x.price)}` : ""} · PnL ${usd(x.pnl)}`, ...ch.map((c) => `     ${c}`));
+    }
+    for (const [key, o] of Object.entries(prev)) {
+      if (now[key]) continue;
+      out.push(`🏁 ${o.side === "long" ? "🟢" : "🔴"} ${o.symbol} ${sideRu(o.side)}: позиция закрыта (PnL на прошлой проверке ${usd(o.pnl)}). Итог — в /journal.`);
+    }
+  }
+  if (!dry) writeJson(STATE, now);
+  if (!out.length) return;
+  const ts = new Date().toLocaleString("ru-RU", { timeZone: TZ, dateStyle: "short", timeStyle: "short" });
+  const text = [`📂 Изменения по позициям — ${ts} (${TZ_LABEL})`, "", ...out].join("\n");
+  if (dry) console.log(`\n--- positions ---\n${text}`);
+  else if (!(await sendSignal(text))) process.exitCode = 1;
 }
 
 // ---------- /coin: analysis and forecast of one coin ----------
@@ -582,10 +683,7 @@ async function coinReports() {
     process.exitCode = 1;
     return;
   }
-  const [btcd, btc] = await Promise.all([
-    safe(btcDominance()),
-    ok.find((r) => r.symbol === "BTC") ?? safe(analyze("BTC-USDT")),
-  ]);
+  const [btcd, btc] = await Promise.all([safe(btcDominance()), btcResult()]);
   const regime = altRegime(btcd?.change24h, btc?.ch1d);
   const n = (x) => String(+x.toPrecision(5));
   const pct = (x) => (x == null ? "—" : `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(1)}%`);
@@ -636,7 +734,7 @@ async function coinReports() {
     if (!side) {
       L.push("🎯 Сетап: нет — на 4ч нет тренда, вход от EMA20 не работает.");
     } else {
-      const ready = tradePlan(r);
+      const ready = btcOk(btc, side) ? tradePlan(r) : null;
       const p = ready ?? levels(r, side);
       L.push(
         `🎯 Сетап: ${side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} от EMA20 4ч · R:R 1:${p.rr.toFixed(1)}`,
@@ -648,29 +746,30 @@ async function coinReports() {
       else if (p.dist > READY_ATR) notes.push(`до входа ${Math.abs((p.entry / r.price - 1) * 100).toFixed(1)}%, цена пока далеко`);
       if (side === "short" && r.rsi4h < 35) notes.push("перепроданность — лучше дождаться отскока");
       if (side === "long" && r.rsi4h > 65) notes.push("перекупленность — лучше дождаться отката");
+      if (!momentumOk(r, side)) notes.push(`нет импульса: RSI 4ч ${r.rsi4h.toFixed(0)}, нужно ${side === "long" ? `выше ${RSI_LONG_MIN}` : `ниже ${RSI_SHORT_MAX}`}`);
+      if (!btcOk(btc, side)) notes.push("против тренда BTC на 4ч");
       if (p.rr < MIN_RR_WEAK) notes.push("R:R меньше 1:1");
       L.push(ready ? "✅ Готов по правилам сканера" : `⏳ Пока не готов: ${notes.join("; ") || "не прошёл фильтры сканера"}`);
       // Buttons only when the plan makes sense now: price before the entry and R:R at least 1:1.
       if (p.dist >= 0 && p.rr >= MIN_RR_WEAK) {
         const s = {
           id: `${Date.now().toString(36)}c`, ts: Date.now(), symbol: r.symbol, side, entry: p.entry, stop: p.stop,
-          target: p.target, rr: +p.rr.toFixed(2), stopPct: p.stopPct, strong: !!ready, repeat: false, manual: true,
+          target: p.target, rr: +p.rr.toFixed(2), stopPct: p.stopPct, validH: ENTRY_VALID_H, strong: !!ready, repeat: false, manual: true,
         };
         if (!dry) appendSignals([s]);
         buttons = [[RISK_MIN, RISK_MAX].map((k) => ({ text: `${side === "long" ? "🟢" : "🔴"} ${r.symbol} ${k}%`, callback_data: `open:${s.id}:${k}` }))];
       }
     }
     // Bounce from a strong level, the scanner's second setup.
-    for (const [j, b] of bouncePlans(r).entries()) {
+    for (const [j, b] of bouncePlans(r).filter((b) => btcOk(btc, b.side)).entries()) {
       L.push(
         "",
-        `↩️ Отскок от уровня ${n(b.level)} (${b.levelTags}): ${b.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} · R:R 1:${b.rr.toFixed(1)}` +
-          (b.counter ? " · ⚠️ против тренда" : ""),
-        `▶️ Вход: ${n(b.entry)} (${b.retest ? "лимит на ретест" : "по рынку"}) · ⛔ Стоп: ${n(b.stop)} · 🎯 Тейк: ${n(b.target)} (${b.tpBy})`,
+        `↩️ Отскок от уровня ${n(b.level)} (${b.levelTags}): ${b.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} · R:R 1:${b.rr.toFixed(1)}`,
+        `▶️ Вход: ${n(b.entry)} (по рынку) · ⛔ Стоп: ${n(b.stop)} · 🎯 Тейк: ${n(b.target)} (${b.tpBy})`,
       );
       const s = {
         id: `${Date.now().toString(36)}b${j}`, ts: Date.now(), symbol: r.symbol, side: b.side, entry: b.entry, stop: b.stop,
-        target: b.target, rr: +b.rr.toFixed(2), stopPct: b.stopPct, strong: false, bounce: true, level: b.level, ...(b.retest ? { retest: true } : {}), repeat: false, manual: true,
+        target: b.target, rr: +b.rr.toFixed(2), stopPct: b.stopPct, validH: ENTRY_VALID_H, strong: false, bounce: true, level: b.level, repeat: false, manual: true,
       };
       if (!dry) appendSignals([s]);
       buttons = [...(buttons ?? []), [RISK_MIN, RISK_MAX].map((k) => ({ text: `↩️${b.side === "long" ? "🟢" : "🔴"} ${r.symbol} ${k}%`, callback_data: `open:${s.id}:${k}` }))];

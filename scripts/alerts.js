@@ -14,7 +14,7 @@
 //   node --env-file=.env scripts/alerts.js SOL HYPE   – only these coins
 import { readFileSync, writeFileSync } from "node:fs";
 import { toSymbols, klines, sleep } from "../src/quotes.js";
-import { sendAll } from "../src/notify.js";
+import { sendInfo } from "../src/notify.js";
 import { env } from "../src/env.js";
 import { TZ, TZ_LABEL } from "../src/market.js";
 import { isPaused } from "../src/store.js";
@@ -165,7 +165,7 @@ const text = lines.join("\n");
 
 if (dry) {
   console.log(text);
-} else if (await sendAll(text)) {
+} else if (await sendInfo(text)) {
   for (const [sym, list] of fresh) state[sym] = { t: now, move: list[0].move };
   writeFileSync(STATE_FILE, JSON.stringify(state));
 } else {

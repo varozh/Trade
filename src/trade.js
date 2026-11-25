@@ -70,7 +70,9 @@ async function isHedgeMode() {
 }
 
 // test: BingX checks the order without placing it (/trade/order/test), leverage is not changed.
-export async function placeOrder(p, { test = false } = {}) {
+// clientOrderId: our own id, used to find and cancel the order later (BingX order ids are 19 digits,
+// too long for a JS number).
+export async function placeOrder(p, { test = false, clientOrderId } = {}) {
   const positionSide = (await isHedgeMode()) ? (p.side === "long" ? "LONG" : "SHORT") : "BOTH";
   if (!test) await client.post("/openApi/swap/v2/trade/leverage", { symbol: p.symbol, side: positionSide, leverage: LEVERAGE });
   const params = {
@@ -82,6 +84,7 @@ export async function placeOrder(p, { test = false } = {}) {
     quantity: p.qty,
     stopLoss: { type: "STOP_MARKET", stopPrice: p.stop, workingType: "MARK_PRICE" },
     takeProfit: { type: "TAKE_PROFIT_MARKET", stopPrice: p.target, workingType: "MARK_PRICE" },
+    ...(clientOrderId ? { clientOrderId } : {}),
   };
   return client.post(test ? "/openApi/swap/v2/trade/order/test" : "/openApi/swap/v2/trade/order", params);
 }
@@ -96,4 +99,31 @@ export async function openPositions() {
     pnl: Number(p.unrealizedProfit),
     leverage: Number(p.leverage),
   }));
+}
+
+// Open orders of the account: pending entries and the stop / take orders of open positions.
+export async function openOrders() {
+  const d = await client.get("/openApi/swap/v2/trade/openOrders", {});
+  return (d?.orders ?? []).map((o) => ({
+    symbol: o.symbol.replace("-USDT", ""),
+    side: o.side, // BUY / SELL
+    positionSide: o.positionSide, // LONG / SHORT / BOTH
+    type: o.type,
+    price: Number(o.price) || 0,
+    stopPrice: Number(o.stopPrice) || 0,
+    reduceOnly: String(o.reduceOnly) === "true",
+    clientOrderId: o.clientOrderID ?? o.clientOrderId ?? "",
+  }));
+}
+// An order that opens a position (not a stop, take or closing order).
+export const isEntryOrder = (o) =>
+  /^(LIMIT|MARKET|TRIGGER_LIMIT|TRIGGER_MARKET)$/.test(o.type) && !o.reduceOnly &&
+  (o.positionSide === "LONG" ? o.side === "BUY" : o.positionSide === "SHORT" ? o.side === "SELL" : true);
+
+export async function orderStatus(symbol, clientOrderId) {
+  const d = await client.get("/openApi/swap/v2/trade/order", { symbol: `${symbol}-USDT`, clientOrderId });
+  return (d?.order ?? d)?.status; // NEW, PENDING, PARTIALLY_FILLED, FILLED, CANCELLED, EXPIRED…
+}
+export async function cancelOrder(symbol, clientOrderId) {
+  return client.delete("/openApi/swap/v2/trade/order", { symbol: `${symbol}-USDT`, clientOrderId });
 }

@@ -5,7 +5,7 @@
 //   node --env-file=.env scripts/journal.js --dry       – print only
 //   node --env-file=.env scripts/journal.js --days 30   – another period
 import { BingXClient } from "../src/bingx.js";
-import { sendAll } from "../src/notify.js";
+import { sendInfo } from "../src/notify.js";
 import { env } from "../src/env.js";
 import { TZ, TZ_LABEL } from "../src/market.js";
 import { sleep } from "../src/quotes.js";
@@ -170,4 +170,4 @@ if (!cur.length) {
 
 const text = lines.filter((l) => l != null).join("\n");
 if (dry) console.log(text);
-else if (!(await sendAll(text))) process.exitCode = 1;
+else if (!(await sendInfo(text))) process.exitCode = 1;

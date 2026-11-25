@@ -4,7 +4,7 @@
 //   node --env-file=.env scripts/top.js           – send
 //   node --env-file=.env scripts/top.js --dry     – print only
 import { pub, watchlist } from "../src/quotes.js";
-import { sendAll } from "../src/notify.js";
+import { sendInfo } from "../src/notify.js";
 import { TZ } from "../src/market.js";
 
 const dry = process.argv.includes("--dry");
@@ -37,17 +37,9 @@ lines.push(
   `🩸 Падение: ${dn.map((x) => `${x.sym} ${pct(x.ch)}`).join(", ")}`,
 );
 const fresh = all.slice(0, TOP).filter((x) => !watch.has(x.sym)).map((x) => x.sym);
-if (fresh.length) lines.push("", `🆕 Нет в списке сканера: ${fresh.join(", ")}`);
+// Sent to VK (informational), so no buttons: new coins are added with /add in the Telegram bot.
+if (fresh.length) lines.push("", `🆕 Нет в списке сканера: ${fresh.join(", ")}`, "➕ Добавить: /add МОНЕТА в Telegram-боте");
 
 const text = lines.join("\n");
 if (dry) console.log(text);
-// Telegram: one "➕ SYM" button per new coin, handled by the bot (adds it to the watchlist).
-else if (!(await sendAll(text, { tgButtons: chunk(fresh.map((s) => ({ text: `➕ ${s}`, callback_data: `add:${s}` })), 3) }))) {
-  process.exitCode = 1;
-}
-
-function chunk(a, n) {
-  const out = [];
-  for (let i = 0; i < a.length; i += n) out.push(a.slice(i, i + n));
-  return out;
-}
+else if (!(await sendInfo(text))) process.exitCode = 1;

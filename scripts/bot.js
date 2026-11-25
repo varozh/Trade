@@ -10,9 +10,9 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { tgCall } from "../src/tg.js";
 import { env } from "../src/env.js";
-import { readSignals, pausedUntil, setPause } from "../src/store.js";
+import { readSignals, pausedUntil, setPause, readJson, writeJson } from "../src/store.js";
 import { TZ } from "../src/market.js";
-import { planOrder, placeOrder, account, openPositions, LEVERAGE } from "../src/trade.js";
+import { planOrder, placeOrder, account, openPositions, openOrders, isEntryOrder, orderStatus, cancelOrder, LEVERAGE } from "../src/trade.js";
 import { watchlist, editWatchlist, pub } from "../src/quotes.js";
 
 const CHAT = String(env("TG_CHAT_ID") ?? "");
@@ -21,7 +21,11 @@ if (!env("TG_BOT_TOKEN") || !CHAT) {
   process.exit(1);
 }
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const SIGNAL_MAX_AGE_H = 6; // older signals cannot be opened from a button
+const SIGNAL_MAX_AGE_H = 6; // older signals cannot be opened from a button (signals without their own validH)
+// How long the entry of a signal is valid: saved with the signal by the scanner (4h), older ones 6h.
+const validMs = (s) => (s.validH ?? SIGNAL_MAX_AGE_H) * 3600e3;
+const ORDERS_FILE = "pending-orders.json"; // entry orders placed from signals, cancelled when the entry expires
+const EXPIRY_CHECK_MS = 5 * 60e3;
 const RISKS = [Number(env("SCAN_RISK_MIN_PCT")) || 5, Number(env("SCAN_RISK_MAX_PCT")) || 15];
 
 const say = (text, buttons) =>
@@ -80,8 +84,8 @@ const commands = {
   async signals() {
     const all = readSignals().filter((s) => !s.manual); // /coin analyses are not scanner signals
     const lastTs = all.at(-1)?.ts;
-    const list = all.filter((s) => s.ts === lastTs && Date.now() - s.ts < SIGNAL_MAX_AGE_H * 3600e3);
-    if (!list.length) return say(`Свежих сигналов нет (не старше ${SIGNAL_MAX_AGE_H} ч). Запустите /scan.`);
+    const list = all.filter((s) => s.ts === lastTs && Date.now() - s.ts < validMs(s));
+    if (!list.length) return say("Свежих сигналов нет: срок входа у последних истёк. Запустите /scan.");
     const lines = [`📋 Сигналы от ${time(lastTs)}:`, ""];
     for (const s of list) {
       lines.push(`${s.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} ${s.symbol} · R:R 1:${s.rr} · вход ${num(s.entry)} · стоп ${num(s.stop)} · тейк ${num(s.target)}`);
@@ -108,13 +112,13 @@ const commands = {
     await say(pos.map((p) => `${p.side === "long" ? "🟢" : "🔴"} ${p.symbol} ×${p.leverage} · ${num(p.qty)} по ${num(p.entry)} · PnL ${usd(p.pnl)}`).join("\n"));
   },
   async journal(arg) {
-    await runAndReport("journal.js", ["--days", String(Number(arg) || 7)], "⏳ Собираю дневник…");
+    await runAndReport("journal.js", ["--days", String(Number(arg) || 7), "--tg"], "⏳ Собираю дневник…");
   },
   async stats(arg) {
-    await runAndReport("signal-stats.js", ["--days", String(Number(arg) || 7)], "⏳ Считаю статистику…");
+    await runAndReport("signal-stats.js", ["--days", String(Number(arg) || 7), "--tg"], "⏳ Считаю статистику…");
   },
   async top() {
-    await runAndReport("top.js", [], "⏳ Собираю список…");
+    await runAndReport("top.js", ["--tg"], "⏳ Собираю список…");
   },
   async coin(arg) {
     const syms = arg.split(/[\s,]+/).filter(Boolean).map(base).slice(0, 3);
@@ -185,7 +189,7 @@ async function onButton(data) {
   if (action === "add") return editCoins(id, true);
   const s = readSignals().find((x) => x.id === id);
   if (!s) return say("Сигнал не найден (возможно, удалён при очистке).");
-  if (Date.now() - s.ts > SIGNAL_MAX_AGE_H * 3600e3) return say(`Сигнал старше ${SIGNAL_MAX_AGE_H} ч, открывать по нему уже нельзя. Запустите /scan.`);
+  if (Date.now() - s.ts > validMs(s)) return say(`Срок входа по сигналу истёк (${validMs(s) / 3600e3} ч), открывать по нему уже нельзя. Запустите /scan.`);
   const risk = Number(riskStr);
 
   let p;
@@ -196,6 +200,13 @@ async function onButton(data) {
   }
 
   if (action === "open") {
+    // Already in the market with this coin: a second entry doubles the risk.
+    const [pos, ord] = await Promise.all([openPositions().catch(() => []), openOrders().catch(() => [])]);
+    const busy = [
+      ...pos.filter((x) => x.symbol === s.symbol).map((x) => `открыта позиция ${x.side === "long" ? "лонг" : "шорт"}`),
+      ...(ord.some((o) => o.symbol === s.symbol && isEntryOrder(o)) ? ["есть ордер на вход"] : []),
+    ];
+    const expires = time(s.ts + validMs(s));
     return say(
       [
         `${p.side === "long" ? "🟢 ЛОНГ" : "🔴 ШОРТ"} ${s.symbol} · риск ${risk}% · плечо ×${LEVERAGE}`,
@@ -203,7 +214,8 @@ async function onButton(data) {
         `⛔ Стоп: ${num(p.stop)} · −${usd(p.loss)}`,
         `🎯 Тейк: ${num(p.target)} · +${usd(p.gain)}`,
         `📦 Объём: ${num(p.qty)} ${p.asset} = ${usd(p.notional)} · маржа ${usd(p.margin)}`,
-        p.immediate ? "⚠️ Цена уже прошла вход: ордер исполнится сразу по рынку." : null,
+        p.immediate ? "⚠️ Цена уже прошла вход: ордер исполнится сразу по рынку." : `⏱ Если не исполнится до ${expires}, бот снимет ордер.`,
+        busy.length ? `⚠️ По ${s.symbol} уже ${busy.join(" и ")}.` : null,
         "",
         "Открыть на реальном счёте?",
       ]
@@ -215,13 +227,47 @@ async function onButton(data) {
 
   if (action === "confirm") {
     try {
-      const r = await placeOrder(p);
+      const clientOrderId = `sig${id}${Date.now().toString(36)}`;
+      const r = await placeOrder(p, { clientOrderId });
       const orderId = r?.order?.orderId ?? r?.orderId ?? "";
+      if (!p.immediate) {
+        const list = readJson(ORDERS_FILE, []);
+        list.push({ symbol: s.symbol, side: p.side, entry: p.entry, clientOrderId, expires: s.ts + validMs(s) });
+        writeJson(ORDERS_FILE, list);
+      }
       return say(`✅ Ордер выставлен: ${s.symbol} ${p.side === "long" ? "лонг" : "шорт"} ${num(p.qty)} по ${num(p.entry)}, стоп ${num(p.stop)}, тейк ${num(p.target)}${orderId ? `\nID: ${orderId}` : ""}`);
     } catch (e) {
       return say(`⚠️ BingX отклонил ордер: ${e.message}`);
     }
   }
+}
+
+// ---------- expired entries ----------
+// A limit entry that did not fill within the signal's validity is cancelled (the backtest showed that late
+// fills mostly happen on a reversal). Filled or already cancelled orders just leave the list.
+let lastExpiryCheck = 0;
+async function cancelExpired() {
+  if (Date.now() - lastExpiryCheck < EXPIRY_CHECK_MS) return;
+  lastExpiryCheck = Date.now();
+  const list = readJson(ORDERS_FILE, []);
+  if (!list.length) return;
+  const keep = [];
+  for (const o of list) {
+    if (Date.now() < o.expires) { keep.push(o); continue; }
+    try {
+      const st = await orderStatus(o.symbol, o.clientOrderId);
+      if (st === "NEW" || st === "PENDING") {
+        await cancelOrder(o.symbol, o.clientOrderId);
+        await say(`⌛ ${o.symbol} ${o.side === "long" ? "лонг" : "шорт"}: лимит ${num(o.entry)} не исполнился за срок сигнала — ордер снят.`);
+      } else if (st === "PARTIALLY_FILLED") {
+        await say(`⌛ ${o.symbol}: срок входа истёк, ордер ${num(o.entry)} исполнен частично — проверьте его на BingX.`);
+      }
+    } catch (e) {
+      console.error(`${new Date().toISOString()} expiry ${o.symbol}: ${e.message}`);
+      if (Date.now() - o.expires < 24 * 3600e3) keep.push(o); // try again later, give up after a day
+    }
+  }
+  writeJson(ORDERS_FILE, keep);
 }
 
 // ---------- main loop ----------
@@ -257,6 +303,7 @@ for (;;) {
     await new Promise((r) => setTimeout(r, 5000));
     continue;
   }
+  await cancelExpired().catch((e) => console.error(`${new Date().toISOString()} expiry: ${e.message}`));
   for (const u of updates) {
     offset = u.update_id + 1;
     try {

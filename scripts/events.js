@@ -4,7 +4,7 @@
 //   node --env-file=.env scripts/events.js          – send to VK / Telegram
 //   node --env-file=.env scripts/events.js --dry    – print only
 import { todayEvents, TZ, TZ_LABEL } from "../src/market.js";
-import { sendAll } from "../src/notify.js";
+import { sendInfo } from "../src/notify.js";
 
 const dry = process.argv.includes("--dry");
 const date = new Date().toLocaleDateString("ru-RU", { timeZone: TZ, day: "numeric", month: "long", weekday: "long" });
@@ -28,5 +28,5 @@ if (!events.length) {
   lines.push("", "⚠️ Около выхода данных возможны резкие движения и проскальзывание.");
   const text = lines.join("\n");
   if (dry) console.log(text);
-  else if (!(await sendAll(text))) process.exitCode = 1;
+  else if (!(await sendInfo(text))) process.exitCode = 1;
 }

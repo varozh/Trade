@@ -1,6 +1,6 @@
 // Weekly statistics of scanner signals: what happened to each signal after it was sent.
 // For every signal of the period (repeats are counted once) it walks 15m candles from the signal time:
-//   the entry is a limit order at `entry`, valid for ENTRY_H hours;
+//   the entry is a limit order at `entry`, valid for `validH` hours (saved with the signal; older ones: 12, 24 for the watch list);
 //   after the fill, whichever comes first: stop (−1R) or take (+R:R). Both in one candle → stop (conservative).
 //
 //   node --env-file=.env scripts/signal-stats.js            – last 7 days, send
@@ -8,15 +8,13 @@
 //   node --env-file=.env scripts/signal-stats.js --days 30
 import { readSignals } from "../src/store.js";
 import { pub, sleep } from "../src/quotes.js";
-import { sendAll } from "../src/notify.js";
+import { sendInfo } from "../src/notify.js";
 import { env } from "../src/env.js";
 import { TZ } from "../src/market.js";
 
 const args = process.argv.slice(2);
 const dry = args.includes("--dry");
 const days = Number(args[args.indexOf("--days") + 1]) || 7;
-const ENTRY_H = 12; // a limit entry not reached within this time is considered missed
-const WATCH_ENTRY_H = 24; // watch-list entries are further away, so they get more time
 const RISK = Number(env("SCAN_RISK_MIN_PCT")) || 5;
 
 const D = 864e5, now = Date.now(), from = now - days * D;
@@ -37,7 +35,7 @@ async function outcome(s) {
   const hitEntry = (x) => (long ? x.l <= s.entry : x.h >= s.entry);
   const hitStop = (x) => (long ? x.l <= s.stop : x.h >= s.stop);
   const hitTake = (x) => (long ? x.h >= s.target : x.l <= s.target);
-  const window = (s.watch || s.retest ? WATCH_ENTRY_H : ENTRY_H) * 3600e3;
+  const window = (s.validH ?? (s.watch || s.retest ? 24 : 12)) * 3600e3;
   const fill = k.findIndex((x) => x.t <= s.ts + window && hitEntry(x));
   if (fill < 0) return { ...s, result: k.at(-1)?.t > s.ts + window ? "missed" : "waiting", r: 0 };
   for (const x of k.slice(fill)) {
@@ -105,4 +103,4 @@ lines.push("", "ℹ️ R — риск сделки: стоп = −1R, тейк =
 
 const text = lines.join("\n");
 if (dry) console.log(text);
-else if (!(await sendAll(text))) process.exitCode = 1;
+else if (!(await sendInfo(text))) process.exitCode = 1;
