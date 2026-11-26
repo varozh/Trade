@@ -36,8 +36,9 @@ const floorTo = (x, digits) => Math.floor(x * 10 ** digits) / 10 ** digits;
 const ceilTo = (x, digits) => Number((Math.ceil(Number((x * 10 ** digits).toFixed(6))) / 10 ** digits).toFixed(digits));
 // Max margin of a minimum order opened when the risk-based size is below BingX's minimum ($, SCAN_MIN_ORDER_MAX_MARGIN).
 export const MIN_ORDER_MAX_MARGIN = Number(env("SCAN_MIN_ORDER_MAX_MARGIN")) > 0 ? Number(env("SCAN_MIN_ORDER_MAX_MARGIN")) : 2;
-// ...and only if its loss at the stop is at most this % of the deposit (SCAN_MIN_ORDER_MAX_RISK_PCT).
-export const MIN_ORDER_MAX_RISK_PCT = Number(env("SCAN_MIN_ORDER_MAX_RISK_PCT")) > 0 ? Number(env("SCAN_MIN_ORDER_MAX_RISK_PCT")) : 3;
+// Optional: also skip a minimum order whose loss at the stop is above this % of the deposit
+// (SCAN_MIN_ORDER_MAX_RISK_PCT). Off by default: with a small deposit it blocked most trades.
+export const MIN_ORDER_MAX_RISK_PCT = Number(env("SCAN_MIN_ORDER_MAX_RISK_PCT")) > 0 ? Number(env("SCAN_MIN_ORDER_MAX_RISK_PCT")) : Infinity;
 const roundTo = (x, digits) => Number(x.toFixed(digits));
 
 // Everything needed to show the order before it is sent. Throws with a readable reason if it cannot be placed.
